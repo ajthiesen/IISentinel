@@ -10,7 +10,7 @@
         - Errors
         - Summary
         - Metadata
-        - Orphaned Certs
+        - OrphanCerts
     Sends HTML email report with workbook attached.
 #>
 
@@ -63,7 +63,9 @@ if ($OU) {
     try {
         $discovered = Get-ADComputer -SearchBase $OU -SearchScope Subtree -Filter {Enabled -eq $true} |
                       Select-Object -ExpandProperty Name
-        $Targets.AddRange($discovered)
+
+        # FIX: ensure AddRange receives a string[] not an object[]
+        $Targets.AddRange($discovered | ForEach-Object { [string]$_ })
     }
     catch {
         throw "OU discovery failed: $($_.Exception.Message)"
@@ -94,47 +96,39 @@ $RemoteScript = {
     function Get-CertDetails {
         param($thumb)
 
-        # Search all relevant stores
-        $stores = @("My","WebHosting","Root","CA","TrustedPeople")
-
-        foreach ($store in $stores) {
-            $cert = Get-ChildItem "Cert:\LocalMachine\$store" -Recurse |
+        try {
+            # thumb is already hex string
+            $cert = Get-ChildItem -Path Cert:\LocalMachine\My -Recurse |
                     Where-Object { $_.Thumbprint -eq $thumb } |
                     Select-Object -First 1
 
-            if ($cert) {
-                $san = $cert.Extensions | Where-Object { $_.Oid.FriendlyName -eq "Subject Alternative Name" }
-                $sanValues = if ($san) {
-                    ($san.Format($false) -split "`n" | ForEach-Object { $_.Trim() }) -join "; "
-                }
+            if (-not $cert) {
+                $cert = Get-ChildItem -Path Cert:\LocalMachine\WebHosting -Recurse |
+                        Where-Object { $_.Thumbprint -eq $thumb } |
+                        Select-Object -First 1
+            }
 
-                $days = [math]::Round(($cert.NotAfter - (Get-Date)).TotalDays)
+            if (-not $cert) { return $null }
 
-                $risk =
-                    if ($days -lt 0) { "Expired" }
-                    elseif ($days -le 30) { "High" }
-                    elseif ($days -le 60) { "Medium" }
-                    elseif ($days -le 90) { "Low" }
-                    else { "OK" }
+            # SAN
+            $san = $cert.Extensions | Where-Object { $_.Oid.FriendlyName -eq "Subject Alternative Name" }
+            $sanValues = $null
+            if ($san) {
+                $sanValues = ($san.Format($false) -split "`n" | ForEach-Object { $_.Trim() }) -join "; "
+            }
 
-                $tls =
-                    if ($cert.SignatureAlgorithm.FriendlyName -match "sha1") { "Weak (SHA1)" }
-                    else { "OK" }
-
-                return [pscustomobject]@{
-                    CertName           = $cert.Subject
-                    CertExpirationDate = $cert.NotAfter
-                    CertDaysRemaining  = $days
-                    Issuer             = $cert.Issuer
-                    SAN                = $sanValues
-                    CertRisk           = $risk
-                    TLSVersion         = $tls
-                    Thumbprint         = $cert.Thumbprint
-                }
+            return [pscustomobject]@{
+                CertName           = $cert.Subject
+                CertExpirationDate = $cert.NotAfter
+                CertDaysRemaining  = [math]::Round(($cert.NotAfter - (Get-Date)).TotalDays)
+                Issuer             = $cert.Issuer
+                SAN                = $sanValues
+                CertRisk           = Get-TlsVersionFlag -cert $cert
             }
         }
-
-        return $null
+        catch {
+            return $null
+        }
     }
 
     $results = @()
@@ -205,6 +199,7 @@ $RemoteScript = {
 
             $certThumb = $null
             $certDetails = $null
+            $tlsVersion = "Unknown"
 
             if ($protocol -eq "https") {
                 try {
@@ -214,6 +209,9 @@ $RemoteScript = {
                 catch {
                     $certDetails = $null
                 }
+
+                # TLS detection (simple heuristic)
+                $tlsVersion = if ($binding.sslFlags -eq 0) { "TLS 1.0/1.1 possible" } else { "TLS 1.2+" }
             }
 
             $results += [pscustomobject]@{
@@ -232,8 +230,8 @@ $RemoteScript = {
                 Issuer              = $certDetails?.Issuer
                 SAN                 = $certDetails?.SAN
                 CertRisk            = $certDetails?.CertRisk
-                TLSVersion          = $certDetails?.TLSVersion
-                Error               = if ($protocol -eq "https" -and -not $certDetails) { "Certificate inspection failed. Thumbprint: $certThumb" } else { "" }
+                TLSVersion          = $tlsVersion
+                Error               = if ($protocol -eq "https" -and -not $certDetails) { "Certificate inspection failed" } else { "" }
             }
         }
     }
@@ -253,6 +251,28 @@ $Errors = $Inventory | Where-Object { $_.Error -ne "" }
 $Expiring = $Inventory | Where-Object { $_.CertDaysRemaining -ne "" -and [int]$_.CertDaysRemaining -le 90 }
 
 # ----------------------------
+# Orphan cert inventory
+# ----------------------------
+$OrphanCerts = @()
+
+foreach ($server in $Targets) {
+    $OrphanCerts += Invoke-Command -ComputerName $server -Credential $Credential -ScriptBlock {
+        Get-ChildItem Cert:\LocalMachine\My -Recurse |
+        Where-Object {
+            # exclude certificates bound to IIS
+            $thumb = $_.Thumbprint
+            $bindings = Get-ChildItem IIS:\Sites | ForEach-Object { $_.Bindings.Collection } |
+                        Where-Object { $_.certificateHash -ne $null } |
+                        ForEach-Object {
+                            ($_.certificateHash | ForEach-Object { $_.ToString("X2") }) -join ""
+                        }
+            $thumb -notin $bindings
+        } |
+        Select-Object PSComputerName, Subject, Issuer, NotAfter, Thumbprint
+    } -ErrorAction SilentlyContinue
+}
+
+# ----------------------------
 # 4) Summary
 # ----------------------------
 $Summary = [pscustomobject]@{
@@ -266,47 +286,7 @@ $Summary = [pscustomobject]@{
 }
 
 # ----------------------------
-# 5) Orphaned Certs (extra worksheet)
-# ----------------------------
-$OrphanedCerts = @()
-
-foreach ($target in $Targets) {
-    $OrphanedCerts += Invoke-Command -ComputerName $target -Credential $Credential -ScriptBlock {
-        # Enumerate certs in LocalMachine\My that are not bound to IIS
-        $boundThumbs = @()
-
-        try {
-            Import-Module WebAdministration -ErrorAction SilentlyContinue
-            $sites = Get-ChildItem IIS:\Sites -ErrorAction SilentlyContinue
-            foreach ($site in $sites) {
-                foreach ($b in $site.Bindings.Collection) {
-                    if ($b.protocol -eq "https" -and $b.certificateHash) {
-                        $thumb = ($b.certificateHash | ForEach-Object { $_.ToString("X2") }) -join ""
-                        $boundThumbs += $thumb
-                    }
-                }
-            }
-        } catch {}
-
-        $allCerts = Get-ChildItem Cert:\LocalMachine\My -Recurse | Where-Object { $_.NotAfter -gt (Get-Date) }
-        foreach ($cert in $allCerts) {
-            $thumb = $cert.Thumbprint
-            if ($boundThumbs -notcontains $thumb) {
-                [pscustomobject]@{
-                    ServerName = $env:COMPUTERNAME
-                    Thumbprint = $thumb
-                    Subject    = $cert.Subject
-                    Issuer     = $cert.Issuer
-                    Expiration = $cert.NotAfter
-                    DaysLeft   = [math]::Round(($cert.NotAfter - (Get-Date)).TotalDays)
-                }
-            }
-        }
-    } -ErrorAction SilentlyContinue
-}
-
-# ----------------------------
-# 6) Export Excel
+# 5) Export Excel
 # ----------------------------
 $ExcelPath = Join-Path $OutputDir "IISentinel_Report_$TimeStamp.xlsx"
 
@@ -320,19 +300,20 @@ $pkg = @{
 $Inventory | Export-Excel @pkg -WorksheetName "Inventory"
 $Errors    | Export-Excel @pkg -WorksheetName "Errors"
 $Summary   | Export-Excel @pkg -WorksheetName "Summary"
-$OrphanedCerts | Export-Excel @pkg -WorksheetName "OrphanedCerts"
 
-$RunMeta = [pscustomobject]@{
+$RunMeta   = [pscustomobject]@{
     RunID = $RunID
     RunDate = $RunDate
     ServerCount = $Targets.Count
 }
 $RunMeta | Export-Excel @pkg -WorksheetName "RunMetadata"
 
+$OrphanCerts | Export-Excel @pkg -WorksheetName "OrphanCerts"
+
 Write-Host "[+] Excel report created: $ExcelPath" -ForegroundColor Green
 
 # ----------------------------
-# 7) Email Report
+# 6) Email Report
 function Build-EmailBody {
     param($summary)
 
