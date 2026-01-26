@@ -1,6 +1,10 @@
 <#
 .SYNOPSIS
-    IISpector v3.2 - IIS & SSL Inventory with Summary, Errors, Run Metadata, and Audit Logging
+    IISpector v3.3 - IIS & SSL Inventory with SAN, Issuer, Binding Parsing, TLS Weakness, and Summary
+
+.DESCRIPTION
+    Parallel execution inventory of IIS sites, bindings, SSL expiry, and risk detection.
+    Produces single Excel workbook with Inventory, Errors, Expiring, and Summary sheets.
 #>
 
 param(
@@ -15,28 +19,17 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Output directory
 $OutputDir = "C:\IISpector"
 if (-not (Test-Path $OutputDir)) { New-Item -Path $OutputDir -ItemType Directory -Force | Out-Null }
 
-$LogPath = Join-Path $OutputDir "IISpector_Run.log"
-function Log {
-    param([string]$Message)
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    "$timestamp - $Message" | Out-File -FilePath $LogPath -Append -Encoding UTF8
-}
-
-Log "=== IISpector Run Started ==="
-
-# Excel Required
+# ImportExcel required
 if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
-    Log "ImportExcel module missing. Exiting."
-    throw "ImportExcel module is required. Install it via: Install-Module -Name ImportExcel"
+    throw "ImportExcel module is required. Install it: Install-Module -Name ImportExcel"
 }
-
 Import-Module ImportExcel -ErrorAction Stop
 
 $RunID = [guid]::NewGuid().ToString()
-Log "RunID: $RunID"
 
 # =========================
 # 1. Target Discovery
@@ -45,38 +38,24 @@ $TargetList = [System.Collections.Generic.List[string]]::new()
 
 if ($ServerNames) {
     $TargetList.AddRange([string[]]$ServerNames)
-    Log "Added explicit server list: $($ServerNames.Count)"
 }
 
 if ($OU) {
-    Log "Discovering servers in OU: $OU"
     if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
         Write-Warning "ActiveDirectory module missing. RSAT required."
-        Log "ActiveDirectory module missing."
     }
     else {
         Import-Module ActiveDirectory
         try {
             $Discovered = Get-ADComputer -SearchBase $OU -SearchScope Subtree -Filter { Enabled -eq $true } -ErrorAction Stop | Select-Object -ExpandProperty Name
-            if ($Discovered) {
-                $TargetList.AddRange([string[]]$Discovered)
-                Log "Found $($Discovered.Count) objects in OU."
-            }
+            if ($Discovered) { $TargetList.AddRange([string[]]$Discovered) }
         }
-        catch {
-            Write-Warning "OU Discovery Error: $($_.Exception.Message)"
-            Log "OU Discovery Error: $($_.Exception.Message)"
-        }
+        catch { Write-Warning "OU Discovery Error: $($_.Exception.Message)" }
     }
 }
 
 $FinalTargets = $TargetList | Sort-Object -Unique
-if ($FinalTargets.Count -eq 0) { 
-    Log "No servers found to target. Exiting."
-    throw "No servers found to target." 
-}
-
-Log "Final target count: $($FinalTargets.Count)"
+if ($FinalTargets.Count -eq 0) { throw "No servers found to target." }
 
 # =========================
 # 2. Remote Execution (Parallel)
@@ -84,9 +63,51 @@ Log "Final target count: $($FinalTargets.Count)"
 $RemoteScript = {
     param($RunID)
 
+    function Get-TlsWeakness {
+        # Detect if TLS1.0 or TLS1.1 is enabled in SCHANNEL
+        $weak = $false
+
+        $protocols = @("TLS 1.0","TLS 1.1")
+        foreach ($p in $protocols) {
+            $key = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\$p\Server"
+            if (Test-Path $key) {
+                $enabled = (Get-ItemProperty -Path $key -Name "Enabled" -ErrorAction SilentlyContinue).Enabled
+                $disabled = (Get-ItemProperty -Path $key -Name "DisabledByDefault" -ErrorAction SilentlyContinue).DisabledByDefault
+
+                if ($enabled -eq 1 -or $disabled -eq 0) {
+                    $weak = $true
+                    break
+                }
+            }
+        }
+        return $weak
+    }
+
+    function Get-CertSAN {
+        param($cert)
+        $sanOid = "2.5.29.17"
+        $ext = $cert.Extensions | Where-Object { $_.Oid.Value -eq $sanOid }
+        if (-not $ext) { return $null }
+
+        $raw = $ext.Format($false)
+        # Format returns "DNS Name=foo, DNS Name=bar" typically
+        return ($raw -replace "DNS Name=", "") -replace "\s*,\s*", ","
+    }
+
+    function Parse-Binding {
+        param($bindingInfo)
+        # Format: ip:port:hostname
+        $parts = $bindingInfo.Split(":")
+        return @{
+            BindingIP   = $parts[0]
+            BindingPort = $parts[1]
+            BindingHost = $parts[2]
+        }
+    }
+
     $results = @()
 
-    # Check IIS installed
+    # Detect IIS installed
     $IISInstalled = (Get-WindowsFeature -Name Web-Server -ErrorAction SilentlyContinue).Installed
 
     if (-not $IISInstalled) {
@@ -98,13 +119,21 @@ $RemoteScript = {
             SiteState    = $null
             Binding      = $null
             Protocol     = $null
+            BindingIP    = $null
+            BindingPort  = $null
+            BindingHost  = $null
             CertName     = $null
+            CertIssuer   = $null
+            CertSAN      = $null
             CertExpirationDate = $null
             CertDaysRemaining  = $null
             CertRisk     = $null
+            TLSWeakness = $null
             Error        = "IIS not installed"
         }
     }
+
+    $tlsWeak = Get-TlsWeakness
 
     try {
         Import-Module WebAdministration -ErrorAction Stop
@@ -119,16 +148,25 @@ $RemoteScript = {
             SiteState    = $null
             Binding      = $null
             Protocol     = $null
+            BindingIP    = $null
+            BindingPort  = $null
+            BindingHost  = $null
             CertName     = $null
+            CertIssuer   = $null
+            CertSAN      = $null
             CertExpirationDate = $null
             CertDaysRemaining  = $null
             CertRisk     = $null
+            TLSWeakness = $tlsWeak
             Error        = "WebAdministration failure: $($_.Exception.Message)"
         }
     }
 
     foreach ($site in $sites) {
         foreach ($binding in $site.Bindings.Collection) {
+
+            $parsed = Parse-Binding -bindingInfo $binding.bindingInformation
+
             $row = [PSCustomObject]@{
                 RunID = $RunID
                 ServerName   = $env:COMPUTERNAME
@@ -137,17 +175,21 @@ $RemoteScript = {
                 SiteState    = $site.State
                 Binding      = $binding.bindingInformation
                 Protocol     = $binding.protocol
+                BindingIP    = $parsed.BindingIP
+                BindingPort  = $parsed.BindingPort
+                BindingHost  = $parsed.BindingHost
                 CertName     = $null
+                CertIssuer   = $null
+                CertSAN      = $null
                 CertExpirationDate = $null
                 CertDaysRemaining  = $null
                 CertRisk     = $null
+                TLSWeakness = $tlsWeak
                 Error        = $null
             }
 
-            # SSL Logic (fixed thumbprint conversion)
             if ($binding.protocol -eq "https" -and $binding.certificateHash) {
                 try {
-                    # Thumbprint conversion (works for both byte[] and string)
                     $thumb = $null
                     if ($binding.certificateHash -is [byte[]]) {
                         $thumb = ($binding.certificateHash | ForEach-Object { "{0:X2}" -f $_ }) -join ""
@@ -169,6 +211,8 @@ $RemoteScript = {
 
                     if ($cert) {
                         $row.CertName = $cert.Subject
+                        $row.CertIssuer = $cert.Issuer
+                        $row.CertSAN = Get-CertSAN -cert $cert
                         $row.CertExpirationDate = $cert.NotAfter
                         $row.CertDaysRemaining = ($cert.NotAfter - (Get-Date)).Days
 
@@ -194,11 +238,8 @@ $RemoteScript = {
 }
 
 Write-Host "[*] Querying $($FinalTargets.Count) servers in parallel..." -ForegroundColor Cyan
-Log "Starting remote queries."
 
 $RawResults = Invoke-Command -ComputerName $FinalTargets -ScriptBlock $RemoteScript -ArgumentList $RunID -Credential $Credential -ErrorAction SilentlyContinue -ThrottleLimit 50
-
-Log "Remote queries completed."
 
 # =========================
 # 3. Data Processing
@@ -234,19 +275,3 @@ $Expiring  | Export-Excel @pkg -WorksheetName "ExpiringCerts"
 $Summary   | Export-Excel @pkg -WorksheetName "Summary"
 
 Write-Host "[+] Report generated: $ExcelPath" -ForegroundColor Green
-Log "Report generated: $ExcelPath"
-
-# =========================
-# 5. Run Metadata
-$MetaPathJson = Join-Path $OutputDir "IISpector_RunMetadata_$TimeStamp.json"
-$MetaPathCsv  = Join-Path $OutputDir "IISpector_RunMetadata_$TimeStamp.csv"
-
-$Summary | ConvertTo-Json | Out-File -FilePath $MetaPathJson
-$Summary | Export-Csv -Path $MetaPathCsv -NoTypeInformation
-
-Write-Host "[+] Run metadata saved: $MetaPathJson"
-Write-Host "[+] Run metadata saved: $MetaPathCsv"
-Log "Run metadata saved: $MetaPathJson"
-Log "Run metadata saved: $MetaPathCsv"
-
-Log "=== IISpector Run Completed ==="
