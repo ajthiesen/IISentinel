@@ -65,7 +65,7 @@ if ($OU) {
                       Select-Object -ExpandProperty Name
 
         # FIX: ensure AddRange receives a string[] not an object[]
-        $Targets.AddRange($discovered | ForEach-Object { [string]$_ })
+        $Targets.AddRange( $discovered | ForEach-Object { [string]$_ } )
     }
     catch {
         throw "OU discovery failed: $($_.Exception.Message)"
