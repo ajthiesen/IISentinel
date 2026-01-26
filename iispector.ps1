@@ -147,7 +147,18 @@ $RemoteScript = {
             # SSL Logic (fixed thumbprint conversion)
             if ($binding.protocol -eq "https" -and $binding.certificateHash) {
                 try {
-                    $thumb = ($binding.certificateHash | ForEach-Object { "{0:X2}" -f [byte]$_ }) -join ""
+                    # Thumbprint conversion (works for both byte[] and string)
+                    $thumb = $null
+                    if ($binding.certificateHash -is [byte[]]) {
+                        $thumb = ($binding.certificateHash | ForEach-Object { "{0:X2}" -f $_ }) -join ""
+                    }
+                    elseif ($binding.certificateHash -is [string]) {
+                        $thumb = $binding.certificateHash -replace '\s',''
+                    }
+                    else {
+                        $thumb = $binding.certificateHash.ToString()
+                    }
+
                     $cert = Get-ChildItem Cert:\LocalMachine\My -Recurse -ErrorAction SilentlyContinue |
                             Where-Object { $_.Thumbprint -eq $thumb } | Select-Object -First 1
 
