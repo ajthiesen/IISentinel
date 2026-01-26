@@ -1,6 +1,17 @@
 <#
 .SYNOPSIS
     IISentinel - IIS & SSL Inventory with Excel and Email Report
+
+.DESCRIPTION
+    Discovers servers from OU or explicit list.
+    Runs in parallel to collect IIS sites, bindings, certificates.
+    Generates a single Excel workbook with:
+        - Inventory
+        - Errors
+        - Summary
+        - Metadata
+        - Orphaned Certificates
+    Sends HTML email report with workbook attached.
 #>
 
 param(
@@ -140,9 +151,15 @@ foreach ($site in Get-ChildItem IIS:\Sites) {
     foreach ($binding in $site.Bindings.Collection) {
 
         $protocol = $binding.protocol
-        $parts = $binding.bindingInformation -split ":"
+        $bindingInfo = $binding.bindingInformation
+
+        # Split host/port from binding info
+        $parts = $bindingInfo -split ":"
         $hostname = if ($parts[2]) { $parts[2] } else { "N/A" }
         $port = $parts[1]
+
+        # auto-detect HTTP vs HTTPS port
+        if ($protocol -eq "https" -and $port -eq "80") { $port = "443" }
 
         $certDetails = $null
 
@@ -158,7 +175,7 @@ foreach ($site in Get-ChildItem IIS:\Sites) {
             IISInstalled       = $true
             SiteName           = $site.Name
             SiteState          = $site.State
-            Binding            = $binding.bindingInformation
+            Binding            = $bindingInfo
             Protocol           = $protocol
             Hostname           = $hostname
             Port               = $port
@@ -243,14 +260,34 @@ $Errors    | Export-Excel @pkg -WorksheetName "Errors"
 $Summary   | Export-Excel @pkg -WorksheetName "Summary"
 $Orphaned  | Export-Excel @pkg -WorksheetName "OrphanedCertificates"
 
+# Run metadata sheet
+$RunMeta = [pscustomobject]@{
+    RunID = $RunID
+    RunDate = $RunDate
+    ServerCount = $Targets.Count
+}
+$RunMeta | Export-Excel @pkg -WorksheetName "RunMetadata"
+
 Write-Host "[+] Excel report created: $ExcelPath" -ForegroundColor Green
 
 # ----------------------------
 # 6) Email
-# ----------------------------
 if ($SendEmail) {
+    $body = @"
+<html>
+<body>
+    <h2>IISentinel Report</h2>
+    <p>Run ID: $RunID</p>
+    <p>Servers scanned: $($Targets.Count)</p>
+    <p>Errors: $($Errors.Count)</p>
+    <p>Orphaned certs: $($Orphaned.Count)</p>
+    <p>See attached report.</p>
+</body>
+</html>
+"@
+
     Send-MailMessage -SmtpServer $SmtpServer -From $From -To $To `
         -Subject "IISentinel Report $TimeStamp" `
-        -Body "IISentinel run complete. See attached report." `
+        -Body $body -BodyAsHtml `
         -Attachments $ExcelPath
 }
