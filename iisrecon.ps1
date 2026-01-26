@@ -24,13 +24,13 @@ $ErrorActionPreference = "Stop"
 # =========================
 # Output Configuration
 # =========================
-$OutputDir = "C:\IISpector"
+$OutputDir = "C:\IISRecon"
 if (-not (Test-Path $OutputDir)) {
     New-Item -Path $OutputDir -ItemType Directory -Force | Out-Null
 }
 
 $TimeStamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$OutputCsv = Join-Path $OutputDir "IISpector_Inventory_$TimeStamp.csv"
+$OutputCsv = Join-Path $OutputDir "IIRecon_Inventory_$TimeStamp.csv"
 
 # =========================
 # 1. Target Discovery
