@@ -9,8 +9,8 @@
         - Inventory
         - Errors
         - Summary
-        - Metadata
-        - Orphaned Certificates
+        - RunMetadata
+        - OrphanedCertificates
     Sends HTML email report with workbook attached.
 #>
 
@@ -123,14 +123,6 @@ function Get-CertDetails {
     }
 }
 
-function Get-IISBindingCipher {
-    param($siteName, $port)
-
-    # Get ciphers using Schannel settings
-    # NOTE: This is only an approximation, real cipher list depends on OS + TLS settings
-    return "N/A"
-}
-
 $results = @()
 $boundThumbprints = @()
 
@@ -141,6 +133,19 @@ if (-not (Get-Service W3SVC -ErrorAction SilentlyContinue)) {
             RunID        = $RunID
             ServerName   = $env:COMPUTERNAME
             IISInstalled = $false
+            SiteName     = ""
+            SiteState    = ""
+            Binding      = ""
+            Protocol     = ""
+            Hostname     = ""
+            Port         = ""
+            CertName     = ""
+            CertExpirationDate = ""
+            CertDaysRemaining  = ""
+            Issuer       = ""
+            SAN          = ""
+            CertRisk     = ""
+            TLSVersion   = ""
             Error        = "IIS not installed"
         })
         Orphaned = @()
@@ -154,6 +159,19 @@ catch {
             RunID        = $RunID
             ServerName   = $env:COMPUTERNAME
             IISInstalled = $true
+            SiteName     = ""
+            SiteState    = ""
+            Binding      = ""
+            Protocol     = ""
+            Hostname     = ""
+            Port         = ""
+            CertName     = ""
+            CertExpirationDate = ""
+            CertDaysRemaining  = ""
+            Issuer       = ""
+            SAN          = ""
+            CertRisk     = ""
+            TLSVersion   = ""
             Error        = "WebAdministration failed"
         })
         Orphaned = @()
@@ -171,11 +189,7 @@ foreach ($site in Get-ChildItem IIS:\Sites) {
         $hostname = if ($parts[2]) { $parts[2] } else { "N/A" }
         $port = $parts[1]
 
-        # auto-detect HTTP vs HTTPS port
-        if ($protocol -eq "https" -and $port -eq "80") { $port = "443" }
-
         $certDetails = $null
-        $cipher = "N/A"
 
         if ($protocol -eq "https" -and $binding.certificateHash) {
             $thumb = ($binding.certificateHash | ForEach-Object { $_.ToString("X2") }) -join ""
@@ -194,23 +208,18 @@ foreach ($site in Get-ChildItem IIS:\Sites) {
             Hostname           = $hostname
             Port               = $port
             CertName           = $certDetails?.CertName
-            Issuer             = $certDetails?.Issuer
-            SAN                = $certDetails?.SAN
             CertExpirationDate = $certDetails?.CertExpirationDate
             CertDaysRemaining  = $certDetails?.CertDaysRemaining
+            Issuer             = $certDetails?.Issuer
+            SAN                = $certDetails?.SAN
             CertRisk           = $certDetails?.CertRisk
             TLSVersion         = $certDetails?.TLSVersion
-            Cipher             = $cipher
-            Error              = if ($protocol -eq "https" -and -not $certDetails) {
-                                    "Certificate inspection failed"
-                                 } else { "" }
+            Error              = if ($protocol -eq "https" -and -not $certDetails) { "Certificate inspection failed" } else { "" }
         }
     }
 }
 
-# ----------------------------
 # Orphaned Certificates
-# ----------------------------
 $orphaned = @()
 foreach ($store in "My","WebHosting") {
     Get-ChildItem "Cert:\LocalMachine\$store" | ForEach-Object {
@@ -276,7 +285,6 @@ $Errors    | Export-Excel @pkg -WorksheetName "Errors"
 $Summary   | Export-Excel @pkg -WorksheetName "Summary"
 $Orphaned  | Export-Excel @pkg -WorksheetName "OrphanedCertificates"
 
-# Run metadata sheet
 $RunMeta = [pscustomobject]@{
     RunID = $RunID
     RunDate = $RunDate
