@@ -53,19 +53,29 @@ if ($ServerNames) {
 }
 
 if ($OU) {
+    Write-Host "[*] Discovering servers in OU: $OU" -ForegroundColor Cyan
+
     if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
-        throw "ActiveDirectory module required for OU discovery."
+        Write-Warning "ActiveDirectory module missing. RSAT required."
     }
+    else {
+        Import-Module ActiveDirectory
 
-    Import-Module ActiveDirectory
+        try {
+            $Discovered = Get-ADComputer -SearchBase $OU -SearchScope Subtree -Filter { Enabled -eq $true } -ErrorAction Stop |
+                          Select-Object -ExpandProperty Name
 
-    try {
-        $discovered = Get-ADComputer -SearchBase $OU -SearchScope Subtree -Filter {Enabled -eq $true} |
-                      Select-Object -ExpandProperty Name
-        $Targets.AddRange($discovered)
-    }
-    catch {
-        throw "OU discovery failed: $($_.Exception.Message)"
+            # Ensure we have a string array
+            $Discovered = [string[]]$Discovered
+
+            if ($Discovered.Count -gt 0) {
+                $TargetList.AddRange($Discovered)
+                Write-Host "    + Found $($Discovered.Count) objects." -ForegroundColor Green
+            }
+        }
+        catch {
+            throw "OU discovery failed: $($_.Exception.Message)"
+        }
     }
 }
 
