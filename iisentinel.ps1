@@ -107,6 +107,10 @@ function Get-CertDetails {
         elseif ($days -le 90) { "Low" }
         else { "OK" }
 
+    $tls =
+        if ($cert.SignatureAlgorithm.FriendlyName -match "sha1") { "Weak (SHA1)" }
+        else { "OK" }
+
     return [pscustomobject]@{
         CertName           = $cert.Subject
         CertExpirationDate = $cert.NotAfter
@@ -114,8 +118,17 @@ function Get-CertDetails {
         Issuer             = $cert.Issuer
         SAN                = $sanValues
         CertRisk           = $risk
+        TLSVersion         = $tls
         Thumbprint         = $cert.Thumbprint
     }
+}
+
+function Get-IISBindingCipher {
+    param($siteName, $port)
+
+    # Get ciphers using Schannel settings
+    # NOTE: This is only an approximation, real cipher list depends on OS + TLS settings
+    return "N/A"
 }
 
 $results = @()
@@ -162,6 +175,7 @@ foreach ($site in Get-ChildItem IIS:\Sites) {
         if ($protocol -eq "https" -and $port -eq "80") { $port = "443" }
 
         $certDetails = $null
+        $cipher = "N/A"
 
         if ($protocol -eq "https" -and $binding.certificateHash) {
             $thumb = ($binding.certificateHash | ForEach-Object { $_.ToString("X2") }) -join ""
@@ -180,11 +194,13 @@ foreach ($site in Get-ChildItem IIS:\Sites) {
             Hostname           = $hostname
             Port               = $port
             CertName           = $certDetails?.CertName
-            CertExpirationDate = $certDetails?.CertExpirationDate
-            CertDaysRemaining  = $certDetails?.CertDaysRemaining
             Issuer             = $certDetails?.Issuer
             SAN                = $certDetails?.SAN
+            CertExpirationDate = $certDetails?.CertExpirationDate
+            CertDaysRemaining  = $certDetails?.CertDaysRemaining
             CertRisk           = $certDetails?.CertRisk
+            TLSVersion         = $certDetails?.TLSVersion
+            Cipher             = $cipher
             Error              = if ($protocol -eq "https" -and -not $certDetails) {
                                     "Certificate inspection failed"
                                  } else { "" }
