@@ -1,18 +1,6 @@
 <#
 .SYNOPSIS
     IISpector v3.2 - IIS & SSL Inventory with Summary, Errors, Run Metadata, and Audit Logging
-
-.DESCRIPTION
-    Parallel execution inventory of IIS sites, bindings, and SSL expiry.
-    Generates a single Excel workbook with:
-      - Inventory
-      - ExpiringCerts
-      - Errors
-      - Summary
-
-    Run metadata is stored separately in JSON + CSV.
-    RunID is included in each row for audit traceability.
-    Local log file is generated for audit and troubleshooting.
 #>
 
 param(
@@ -27,11 +15,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# Output Configuration
 $OutputDir = "C:\IISpector"
 if (-not (Test-Path $OutputDir)) { New-Item -Path $OutputDir -ItemType Directory -Force | Out-Null }
 
-# Logging
 $LogPath = Join-Path $OutputDir "IISpector_Run.log"
 function Log {
     param([string]$Message)
@@ -49,7 +35,6 @@ if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
 
 Import-Module ImportExcel -ErrorAction Stop
 
-# Generate RunID
 $RunID = [guid]::NewGuid().ToString()
 Log "RunID: $RunID"
 
@@ -159,13 +144,16 @@ $RemoteScript = {
                 Error        = $null
             }
 
-            # SSL Logic
+            # SSL Logic (fixed thumbprint conversion)
             if ($binding.protocol -eq "https" -and $binding.certificateHash) {
                 try {
-                    $thumb = ($binding.certificateHash | ForEach-Object { $_.ToString("X2") }) -join ""
-                    $cert = Get-ChildItem Cert:\LocalMachine\My -Recurse | Where-Object { $_.Thumbprint -eq $thumb } | Select-Object -First 1
+                    $thumb = ($binding.certificateHash | ForEach-Object { "{0:X2}" -f [byte]$_ }) -join ""
+                    $cert = Get-ChildItem Cert:\LocalMachine\My -Recurse -ErrorAction SilentlyContinue |
+                            Where-Object { $_.Thumbprint -eq $thumb } | Select-Object -First 1
+
                     if (-not $cert) {
-                        $cert = Get-ChildItem Cert:\LocalMachine\WebHosting -Recurse | Where-Object { $_.Thumbprint -eq $thumb } | Select-Object -First 1
+                        $cert = Get-ChildItem Cert:\LocalMachine\WebHosting -Recurse -ErrorAction SilentlyContinue |
+                                Where-Object { $_.Thumbprint -eq $thumb } | Select-Object -First 1
                     }
 
                     if ($cert) {
@@ -173,7 +161,6 @@ $RemoteScript = {
                         $row.CertExpirationDate = $cert.NotAfter
                         $row.CertDaysRemaining = ($cert.NotAfter - (Get-Date)).Days
 
-                        # Risk flags
                         if ($row.CertDaysRemaining -le 30) { $row.CertRisk = "30-day expiry" }
                         elseif ($row.CertDaysRemaining -le 60) { $row.CertRisk = "60-day expiry" }
                         elseif ($row.CertDaysRemaining -le 90) { $row.CertRisk = "90-day expiry" }
@@ -208,7 +195,6 @@ $Inventory = $RawResults | Select-Object * -ExcludeProperty RunspaceId, PSComput
 $Errors    = $Inventory | Where-Object { $_.Error -ne $null }
 $Expiring  = $Inventory | Where-Object { $_.CertDaysRemaining -ne $null -and [int]$_.CertDaysRemaining -le 90 }
 
-# Summary
 $Summary = [PSCustomObject]@{
     RunID                = $RunID
     RunDate              = (Get-Date)
@@ -240,7 +226,7 @@ Write-Host "[+] Report generated: $ExcelPath" -ForegroundColor Green
 Log "Report generated: $ExcelPath"
 
 # =========================
-# 5. Run Metadata (Separate JSON + CSV)
+# 5. Run Metadata
 $MetaPathJson = Join-Path $OutputDir "IISpector_RunMetadata_$TimeStamp.json"
 $MetaPathCsv  = Join-Path $OutputDir "IISpector_RunMetadata_$TimeStamp.csv"
 
@@ -251,24 +237,5 @@ Write-Host "[+] Run metadata saved: $MetaPathJson"
 Write-Host "[+] Run metadata saved: $MetaPathCsv"
 Log "Run metadata saved: $MetaPathJson"
 Log "Run metadata saved: $MetaPathCsv"
-
-# =========================
-# 6. Email Notification
-if ($SendEmail -and $Expiring) {
-    $style = "<style>table{border-collapse:collapse;width:100%} th,td{border:1px solid #ddd;padding:8px} th{background:#f2f2f2}</style>"
-    $body  = "<h2>IISpector Alert</h2><h3>Expiring Certificates (Next 90 Days)</h3>$($Expiring | Select-Object ServerName,SiteName,CertDaysRemaining | ConvertTo-Html -Fragment)"
-    
-    $params = @{
-        From       = $From
-        To         = $To
-        Subject    = "IIS Cert Alert: $($Expiring.Count) certificates expiring"
-        Body       = "<html><head>$style</head><body>$body</body></html>"
-        SmtpServer = $SmtpServer
-        BodyAsHtml = $true
-    }
-    Send-MailMessage @params
-    Write-Host "[+] Email alert sent." -ForegroundColor Green
-    Log "Email alert sent."
-}
 
 Log "=== IISpector Run Completed ==="
