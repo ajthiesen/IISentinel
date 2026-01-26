@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    IISpector v3.1 - IIS & SSL Inventory with Summary, Errors, Run Metadata, and Audit Logging
+    IISpector v3.2 - IIS & SSL Inventory with Summary, Errors, Run Metadata, and Audit Logging
 
 .DESCRIPTION
     Parallel execution inventory of IIS sites, bindings, and SSL expiry.
@@ -41,7 +41,13 @@ function Log {
 
 Log "=== IISpector Run Started ==="
 
-$ExcelAvailable = (Get-Module -ListAvailable -Name ImportExcel)
+# Excel Required
+if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
+    Log "ImportExcel module missing. Exiting."
+    throw "ImportExcel module is required. Install it via: Install-Module -Name ImportExcel"
+}
+
+Import-Module ImportExcel -ErrorAction Stop
 
 # Generate RunID
 $RunID = [guid]::NewGuid().ToString()
@@ -225,19 +231,13 @@ $pkg = @{
     BoldTopRow  = $true
 }
 
-if ($ExcelAvailable) {
-    $Inventory | Export-Excel @pkg -WorksheetName "Inventory"
-    $Errors    | Export-Excel @pkg -WorksheetName "Errors"
-    $Expiring  | Export-Excel @pkg -WorksheetName "ExpiringCerts"
-    $Summary   | Export-Excel @pkg -WorksheetName "Summary"
+$Inventory | Export-Excel @pkg -WorksheetName "Inventory"
+$Errors    | Export-Excel @pkg -WorksheetName "Errors"
+$Expiring  | Export-Excel @pkg -WorksheetName "ExpiringCerts"
+$Summary   | Export-Excel @pkg -WorksheetName "Summary"
 
-    Write-Host "[+] Report generated: $ExcelPath" -ForegroundColor Green
-    Log "Report generated: $ExcelPath"
-}
-else {
-    Write-Warning "ImportExcel module not found. Excel export requires ImportExcel."
-    Log "ImportExcel module missing. No Excel report generated."
-}
+Write-Host "[+] Report generated: $ExcelPath" -ForegroundColor Green
+Log "Report generated: $ExcelPath"
 
 # =========================
 # 5. Run Metadata (Separate JSON + CSV)
