@@ -65,12 +65,16 @@ if ($OU) {
             $Discovered = Get-ADComputer -SearchBase $OU -SearchScope Subtree -Filter { Enabled -eq $true } -ErrorAction Stop |
                           Select-Object -ExpandProperty Name
 
-            # Ensure we have a string array
+            # Cast to string array (safe)
             $Discovered = [string[]]$Discovered
 
-            if ($Discovered.Count -gt 0) {
+            # Only add if we have results
+            if ($Discovered -and $Discovered.Length -gt 0) {
                 $TargetList.AddRange($Discovered)
-                Write-Host "    + Found $($Discovered.Count) objects." -ForegroundColor Green
+                Write-Host "    + Found $($Discovered.Length) objects." -ForegroundColor Green
+            }
+            else {
+                Write-Warning "No computers found in OU."
             }
         }
         catch {
