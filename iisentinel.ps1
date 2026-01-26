@@ -346,4 +346,4 @@ if ($SendEmail) {
     Send-Email -smtp $SmtpServer -from $From -to $To -subject $subject -body $body -attachment $ExcelPath
     Write-Host "[+] Email sent to $To" -ForegroundColor Green
 }
-Write-Host "[*] IISentinel completed." -ForegroundColor Cyan
+Write-Host "[*] IISentinel scan completed." -ForegroundColor Cyan
