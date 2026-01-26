@@ -24,13 +24,13 @@ $ErrorActionPreference = "Stop"
 # =========================
 # Output Configuration
 # =========================
-$OutputDir = "C:\IISRecon"
+$OutputDir = "C:\IISpector"
 if (-not (Test-Path $OutputDir)) {
     New-Item -Path $OutputDir -ItemType Directory -Force | Out-Null
 }
 
 $TimeStamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$OutputCsv = Join-Path $OutputDir "IIRecon_Inventory_$TimeStamp.csv"
+$OutputCsv = Join-Path $OutputDir "IISpector_Inventory_$TimeStamp.csv"
 
 # =========================
 # 1. Target Discovery
@@ -148,7 +148,14 @@ $RemoteScript = {
             # --- HTTPS Certificate Inspection ---
             if ($binding.protocol -eq "https" -and $binding.certificateHash) {
                 try {
-                    $thumbprint = ($binding.certificateHash | ForEach-Object { $_.ToString("X2") }) -join ""
+
+                    # --- Robust thumbprint conversion ---
+                    if ($binding.certificateHash -is [byte[]]) {
+                        $thumbprint = [BitConverter]::ToString($binding.certificateHash).Replace('-', '')
+                    }
+                    else {
+                        $thumbprint = $binding.certificateHash.ToString().Replace(' ', '').Replace('-', '')
+                    }
 
                     $cert = Get-ChildItem Cert:\LocalMachine\My -Recurse |
                             Where-Object { $_.Thumbprint -eq $thumbprint } |
