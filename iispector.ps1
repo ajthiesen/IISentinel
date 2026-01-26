@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    IISpector v3.3 - IIS & SSL Inventory with SAN, Issuer, Binding Parsing, TLS Weakness, and Summary
+    IISpector v3.4 - IIS & SSL Inventory with SAN, Issuer, Binding Parsing, TLS Version Detection, and Summary
 
 .DESCRIPTION
     Parallel execution inventory of IIS sites, bindings, SSL expiry, and risk detection.
@@ -63,11 +63,11 @@ if ($FinalTargets.Count -eq 0) { throw "No servers found to target." }
 $RemoteScript = {
     param($RunID)
 
-    function Get-TlsWeakness {
-        # Detect if TLS1.0 or TLS1.1 is enabled in SCHANNEL
-        $weak = $false
+    function Get-TlsProtocols {
+        # Detect which TLS versions are enabled in SCHANNEL
+        $protocols = @("SSL 2.0","SSL 3.0","TLS 1.0","TLS 1.1","TLS 1.2","TLS 1.3")
+        $enabledList = @()
 
-        $protocols = @("TLS 1.0","TLS 1.1")
         foreach ($p in $protocols) {
             $key = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\$p\Server"
             if (Test-Path $key) {
@@ -75,12 +75,12 @@ $RemoteScript = {
                 $disabled = (Get-ItemProperty -Path $key -Name "DisabledByDefault" -ErrorAction SilentlyContinue).DisabledByDefault
 
                 if ($enabled -eq 1 -or $disabled -eq 0) {
-                    $weak = $true
-                    break
+                    $enabledList += $p
                 }
             }
         }
-        return $weak
+
+        return $enabledList -join ", "
     }
 
     function Get-CertSAN {
@@ -90,13 +90,11 @@ $RemoteScript = {
         if (-not $ext) { return $null }
 
         $raw = $ext.Format($false)
-        # Format returns "DNS Name=foo, DNS Name=bar" typically
         return ($raw -replace "DNS Name=", "") -replace "\s*,\s*", ","
     }
 
     function Parse-Binding {
         param($bindingInfo)
-        # Format: ip:port:hostname
         $parts = $bindingInfo.Split(":")
         return @{
             BindingIP   = $parts[0]
@@ -128,12 +126,14 @@ $RemoteScript = {
             CertExpirationDate = $null
             CertDaysRemaining  = $null
             CertRisk     = $null
+            TLSProtocolsEnabled = $null
             TLSWeakness = $null
             Error        = "IIS not installed"
         }
     }
 
-    $tlsWeak = Get-TlsWeakness
+    $tlsProtocols = Get-TlsProtocols
+    $tlsWeak = ($tlsProtocols -match "TLS 1.0|TLS 1.1|SSL 2.0|SSL 3.0")
 
     try {
         Import-Module WebAdministration -ErrorAction Stop
@@ -157,6 +157,7 @@ $RemoteScript = {
             CertExpirationDate = $null
             CertDaysRemaining  = $null
             CertRisk     = $null
+            TLSProtocolsEnabled = $tlsProtocols
             TLSWeakness = $tlsWeak
             Error        = "WebAdministration failure: $($_.Exception.Message)"
         }
@@ -184,6 +185,7 @@ $RemoteScript = {
                 CertExpirationDate = $null
                 CertDaysRemaining  = $null
                 CertRisk     = $null
+                TLSProtocolsEnabled = $tlsProtocols
                 TLSWeakness = $tlsWeak
                 Error        = $null
             }
