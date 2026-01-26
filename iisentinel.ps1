@@ -64,8 +64,8 @@ if ($OU) {
         $discovered = Get-ADComputer -SearchBase $OU -SearchScope Subtree -Filter {Enabled -eq $true} |
                       Select-Object -ExpandProperty Name
 
-        # FIX: ensure AddRange receives a string[] not an object[]
-        $Targets.AddRange( $discovered | ForEach-Object { [string]$_ } )
+        # FIXED: Convert to string[] before AddRange
+        $Targets.AddRange($discovered | ForEach-Object { [string]$_ })
     }
     catch {
         throw "OU discovery failed: $($_.Exception.Message)"
@@ -194,7 +194,6 @@ $RemoteScript = {
             $hostname = $parts[2]
             $port = $parts[1]
 
-            # If binding is "*:443:" host may be empty
             if (-not $hostname) { $hostname = "N/A" }
 
             $certThumb = $null
@@ -210,7 +209,6 @@ $RemoteScript = {
                     $certDetails = $null
                 }
 
-                # TLS detection (simple heuristic)
                 $tlsVersion = if ($binding.sslFlags -eq 0) { "TLS 1.0/1.1 possible" } else { "TLS 1.2+" }
             }
 
@@ -259,7 +257,6 @@ foreach ($server in $Targets) {
     $OrphanCerts += Invoke-Command -ComputerName $server -Credential $Credential -ScriptBlock {
         Get-ChildItem Cert:\LocalMachine\My -Recurse |
         Where-Object {
-            # exclude certificates bound to IIS
             $thumb = $_.Thumbprint
             $bindings = Get-ChildItem IIS:\Sites | ForEach-Object { $_.Bindings.Collection } |
                         Where-Object { $_.certificateHash -ne $null } |
