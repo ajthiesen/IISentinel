@@ -220,7 +220,7 @@ $RawResults = Invoke-Command `
     -Credential $Credential `
     -ScriptBlock $RemoteScript `
     -ArgumentList $WarningDays `
-    -ThrottleLimit 32 `
+    -ThrottleLimit 50 `
     -ErrorAction SilentlyContinue `
     -ErrorVariable WinRMErrors
 
