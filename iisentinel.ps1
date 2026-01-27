@@ -1,185 +1,239 @@
 <#
 .SYNOPSIS
-    IISentinel - IIS & SSL Inventory with Excel and Email Report
+    IISentinel - IIS & SSL Inventory with Excel and Email Report.
+    Compatible with Windows PowerShell 5.1 and PowerShell 7+.
+
+.DESCRIPTION
+    Scans servers for IIS Bindings and SSL Certificates.
+    Identifies expiring certificates, weak algorithms, and orphaned certificates.
+    Generates an Excel report and optionally emails a summary.
+
+.EXAMPLE
+    .\IISentinel.ps1 -ServerNames "WEB01", "WEB02" -SendEmail -To "admin@domain.com"
 #>
 
+[CmdletBinding()]
 param(
+    [Parameter(ValueFromPipeline = $true)]
     [string[]]$ServerNames,
+
     [string]$OU,
+
     [pscredential]$Credential,
+
+    [string]$OutputPath = "C:\IISentinel",
+
     [switch]$SendEmail,
-    [string]$SmtpServer,
-    [string]$From,
-    [string]$To
+    [string]$SmtpServer = "smtp.yourdomain.com",
+    [string]$From = "IISentinel@yourdomain.com",
+    [string[]]$To,
+    [string]$EmailSubject = "IIS SSL Inventory Report"
 )
 
 $ErrorActionPreference = "Stop"
 
 # ------------------------------------------------------------
-# Output
+# 1) Setup & Validation
 # ------------------------------------------------------------
-$OutputDir = "C:\IISentinel"
-if (-not (Test-Path $OutputDir)) {
-    New-Item -Path $OutputDir -ItemType Directory -Force | Out-Null
+if (-not (Test-Path $OutputPath)) {
+    try {
+        New-Item -Path $OutputPath -ItemType Directory -Force | Out-Null
+    }
+    catch {
+        Throw "Could not create output directory: $OutputPath. Run as Admin or change path."
+    }
 }
 
 if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
-    throw "ImportExcel module required. Install-Module ImportExcel"
+    Throw "ImportExcel module required. Run: Install-Module ImportExcel -Scope CurrentUser"
 }
 
-# ------------------------------------------------------------
-# Run metadata
-# ------------------------------------------------------------
-$RunID     = [guid]::NewGuid().ToString()
 $RunDate   = Get-Date
 $TimeStamp = $RunDate.ToString("yyyyMMdd-HHmm")
 
 # ------------------------------------------------------------
-# 1) Discover Targets
+# 2) Target Discovery
 # ------------------------------------------------------------
+Write-Host "[*] Discovering targets..." -ForegroundColor Cyan
 $Targets = [System.Collections.Generic.List[string]]::new()
 
 if ($ServerNames) {
-    $Targets.AddRange([string[]]$ServerNames)
+    $Targets.AddRange($ServerNames)
 }
 
 if ($OU) {
-    if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
-        throw "ActiveDirectory module required for OU discovery."
+    if (Get-Module -ListAvailable -Name ActiveDirectory) {
+        Write-Verbose "Querying AD OU: $OU"
+        try {
+            $adComputers = Get-ADComputer -SearchBase $OU -SearchScope Subtree -Filter { Enabled -eq $true } | 
+                           Select-Object -ExpandProperty Name
+            if ($adComputers) {
+                [string[]]$adStringArray = $adComputers
+                $Targets.AddRange($adStringArray)
+            }
+        }
+        catch {
+            Write-Warning "AD Discovery failed: $($_.Exception.Message)"
+        }
     }
-
-    Import-Module ActiveDirectory
-
-    try {
-        $discovered = Get-ADComputer `
-            -SearchBase $OU `
-            -SearchScope Subtree `
-            -Filter { Enabled -eq $true } |
-            Select-Object -ExpandProperty Name
-
-        # *** CRITICAL FIX ***
-        # AddRange requires string[]
-        [string[]]$discoveredStrings = $discovered
-        $Targets.AddRange($discoveredStrings)
-    }
-    catch {
-        throw "OU discovery failed: $($_.Exception.Message)"
+    else {
+        Write-Warning "ActiveDirectory module not found. Skipping OU discovery."
     }
 }
 
 $Targets = $Targets | Sort-Object -Unique
+
 if ($Targets.Count -eq 0) {
-    throw "No servers found."
+    Throw "No targets found. Please provide -ServerNames or a valid -OU."
 }
 
-Write-Host "[*] Targets discovered: $($Targets.Count)" -ForegroundColor Cyan
+Write-Host "[+] Targets identified: $($Targets.Count)" -ForegroundColor Green
 
 # ------------------------------------------------------------
-# 2) Remote Script
+# 3) Remote Execution Block
 # ------------------------------------------------------------
 $RemoteScript = {
-    param($RunID)
+    $ErrorActionPreference = "SilentlyContinue"
+    Import-Module WebAdministration
 
-    function Normalize-Thumbprint {
-        param($t)
-        if (-not $t) { return $null }
-        return $t.Replace(" ", "").ToUpper()
+    # --- Helper Functions ---
+    function Normalize-Thumbprint ($t) {
+        if ([string]::IsNullOrWhiteSpace($t)) { return $null }
+        return $t.Replace(" ", "").Replace(":", "").ToUpper()
     }
 
-    function Get-CertDetails {
-        param($thumb)
-
-        $thumb = Normalize-Thumbprint $thumb
-
-        $cert = Get-ChildItem Cert:\LocalMachine\My -Recurse -ErrorAction SilentlyContinue |
-            Where-Object {
-                (Normalize-Thumbprint $_.Thumbprint) -eq $thumb
-            } |
-            Select-Object -First 1
-
-        if (-not $cert) {
-            $cert = Get-ChildItem Cert:\LocalMachine\WebHosting -Recurse -ErrorAction SilentlyContinue |
-                Where-Object {
-                    (Normalize-Thumbprint $_.Thumbprint) -eq $thumb
-                } |
-                Select-Object -First 1
-        }
-
-        if (-not $cert) { return $null }
-
-        $san = $cert.Extensions |
-            Where-Object { $_.Oid.FriendlyName -eq "Subject Alternative Name" }
-
-        $sanValue = $null
-        if ($san) {
-            $sanValue = ($san.Format($false) -split "`n" | ForEach-Object { $_.Trim() }) -join "; "
-        }
-
+    # --- IIS Check ---
+    $iisFeature = Get-WindowsFeature Web-Server
+    if (-not $iisFeature.Installed) {
         return [pscustomobject]@{
-            CertName           = $cert.Subject
-            CertExpirationDate = $cert.NotAfter
-            CertDaysRemaining  = [math]::Round(($cert.NotAfter - (Get-Date)).TotalDays)
-            Issuer             = $cert.Issuer
-            SAN                = $sanValue
-            CertRisk           = if ($cert.SignatureAlgorithm.FriendlyName -match "sha1") { "Weak (SHA1)" } else { "OK" }
+            Type = "Error"
+            Data = [pscustomobject]@{
+                ServerName = $env:COMPUTERNAME
+                Error      = "IIS not installed"
+            }
         }
     }
 
-    # IIS installed?
-    $iis = Get-WindowsFeature Web-Server -ErrorAction SilentlyContinue
-    if (-not $iis -or -not $iis.Installed) {
-        return [pscustomobject]@{
-            RunID        = $RunID
-            ServerName   = $env:COMPUTERNAME
-            IISInstalled = $false
-            Error        = "IIS not installed"
+    # --- Collect All Local Certs (My + WebHosting) ---
+    # We load these once into a Hashset for fast lookup later
+    $localCerts = @(
+        Get-ChildItem Cert:\LocalMachine\My -Recurse
+        Get-ChildItem Cert:\LocalMachine\WebHosting -Recurse
+    )
+    
+    # Dictionary for fast lookup: Key=Thumbprint, Value=CertObject
+    $certMap = @{}
+    foreach ($c in $localCerts) {
+        $tp = Normalize-Thumbprint $c.Thumbprint
+        if (-not $certMap.ContainsKey($tp)) {
+            $certMap[$tp] = $c
         }
     }
-
-    Import-Module WebAdministration -ErrorAction Stop
 
     $results = @()
-    $sites = Get-ChildItem IIS:\Sites
+    $boundThumbprints = [System.Collections.Generic.HashSet[string]]::new()
 
+    # --- Scan Sites & Bindings ---
+    $sites = Get-ChildItem IIS:\Sites
     foreach ($site in $sites) {
         foreach ($binding in $site.Bindings.Collection) {
-
+            
             $bindingInfo = $binding.bindingInformation
             $parts = $bindingInfo -split ":"
-
-            $port     = $parts[1]
-            $hostname = if ($parts[2]) { $parts[2] } else { "N/A" }
-
+            $port = $parts[1]
+            $hostname = if ($parts[2]) { $parts[2] } else { "(Empty)" }
+            
+            # Default values
             $certDetails = $null
-            $tlsVersion  = ""
+            $sslRisk     = $null
+            $sslFlags    = "N/A"
 
+            # HTTPS Logic
             if ($binding.protocol -eq "https") {
-                try {
-                    $thumb = ($binding.certificateHash | ForEach-Object { $_.ToString("X2") }) -join ""
-                    $certDetails = Get-CertDetails -thumb $thumb
-                    $tlsVersion  = if ($binding.sslFlags -eq 0) { "TLS 1.0/1.1 possible" } else { "TLS 1.2+" }
+                # Get clean thumbprint from binding
+                $rawHash = $binding.certificateHash
+                if ($rawHash) {
+                    $bindThumb = ($rawHash | ForEach-Object { $_.ToString("X2") }) -join ""
+                    $bindThumb = Normalize-Thumbprint $bindThumb
+                    
+                    # Track for Orphan check
+                    $null = $boundThumbprints.Add($bindThumb)
+
+                    # Lookup in our pre-loaded map
+                    if ($certMap.ContainsKey($bindThumb)) {
+                        $cert = $certMap[$bindThumb]
+                        
+                        # Parse SAN
+                        $sanExt = $cert.Extensions | Where-Object { $_.Oid.FriendlyName -eq "Subject Alternative Name" }
+                        $sanValue = if ($sanExt) { ($sanExt.Format($false) -split "`n" | ForEach-Object { $_.Trim() }) -join "; " } else { $null }
+
+                        # Risk Logic
+                        $algo = $cert.SignatureAlgorithm.FriendlyName
+                        $sslRisk = if ($algo -match "sha1" -or $algo -match "md5") { "Weak ($algo)" } else { "OK" }
+
+                        $certDetails = [pscustomobject]@{
+                            Subject    = $cert.Subject
+                            Issuer     = $cert.Issuer
+                            NotAfter   = $cert.NotAfter
+                            DaysLeft   = [math]::Round(($cert.NotAfter - (Get-Date)).TotalDays)
+                            SAN        = $sanValue
+                            Thumbprint = $bindThumb
+                        }
+                    }
                 }
-                catch {}
+
+                # Decode SSL Flags (Sum of values)
+                # 0=Default, 1=SNI, 2=CCS, 3=SNI+CCS
+                $f = $binding.sslFlags
+                switch ($f) {
+                    0 { $sslFlags = "No SNI" }
+                    1 { $sslFlags = "SNI Enabled" }
+                    2 { $sslFlags = "Central Cert Store" }
+                    3 { $sslFlags = "SNI + CCS" }
+                    default { $sslFlags = "Flags: $f" }
+                }
             }
 
+            # Add Binding Result
             $results += [pscustomobject]@{
-                RunID              = $RunID
-                ServerName         = $env:COMPUTERNAME
-                IISInstalled       = $true
-                SiteName           = $site.Name
-                SiteState          = $site.State
-                Binding            = $bindingInfo
-                Protocol           = $binding.protocol
-                Hostname           = $hostname
-                Port               = $port
-                CertName           = $certDetails?.CertName
-                CertExpirationDate = $certDetails?.CertExpirationDate
-                CertDaysRemaining  = $certDetails?.CertDaysRemaining
-                Issuer             = $certDetails?.Issuer
-                SAN                = $certDetails?.SAN
-                CertRisk           = $certDetails?.CertRisk
-                TLSVersion         = $tlsVersion
-                Error              = if ($binding.protocol -eq "https" -and -not $certDetails) { "Certificate inspection failed" } else { "" }
+                Type = "Inventory"
+                Data = [pscustomobject]@{
+                    ServerName   = $env:COMPUTERNAME
+                    SiteName     = $site.Name
+                    State        = $site.State
+                    Protocol     = $binding.protocol
+                    Hostname     = $hostname
+                    Port         = $port
+                    SSLFlags     = $sslFlags
+                    CertName     = if ($certDetails) { $certDetails.Subject } else { $null }
+                    DaysLeft     = if ($certDetails) { $certDetails.DaysLeft } else { $null }
+                    Expiration   = if ($certDetails) { $certDetails.NotAfter } else { $null }
+                    Issuer       = if ($certDetails) { $certDetails.Issuer } else { $null }
+                    Risk         = $sslRisk
+                    Error        = if ($binding.protocol -eq "https" -and -not $certDetails) { "Cert Missing/Unreadable" } else { $null }
+                }
+            }
+        }
+    }
+
+    # --- Scan for Orphans ---
+    # Orphans = Certs in 'My' store that are NOT in $boundThumbprints
+    foreach ($key in $certMap.Keys) {
+        if (-not $boundThumbprints.Contains($key)) {
+            $c = $certMap[$key]
+            
+            # Filter: Ignore root CAs or expired junk usually found? 
+            # For now, just report everything not bound.
+            $results += [pscustomobject]@{
+                Type = "Orphan"
+                Data = [pscustomobject]@{
+                    ServerName = $env:COMPUTERNAME
+                    Subject    = $c.Subject
+                    Issuer     = $c.Issuer
+                    Expiration = $c.NotAfter
+                    DaysLeft   = [math]::Round(($c.NotAfter - (Get-Date)).TotalDays)
+                    Thumbprint = $key
+                }
             }
         }
     }
@@ -188,67 +242,106 @@ $RemoteScript = {
 }
 
 # ------------------------------------------------------------
-# 3) Run Inventory
+# 4) Processing
 # ------------------------------------------------------------
-$Inventory = Invoke-Command `
+Write-Host "[*] Scanning servers (Timeout: 2 mins per batch)..." -ForegroundColor Cyan
+
+$RawResults = Invoke-Command `
     -ComputerName $Targets `
     -Credential $Credential `
     -ScriptBlock $RemoteScript `
-    -ArgumentList $RunID `
-    -ThrottleLimit 32 `
-    -ErrorAction SilentlyContinue
+    -ThrottleLimit 20 `
+    -ErrorAction SilentlyContinue `
+    -ErrorVariable ConnErrors
 
-$Errors   = $Inventory | Where-Object { $_.Error }
-$Expiring = $Inventory | Where-Object { $_.CertDaysRemaining -ne $null -and $_.CertDaysRemaining -le 90 }
+# Separate Data Streams
+$Inventory   = ($RawResults | Where-Object { $_.Type -eq "Inventory" }).Data
+$Orphans     = ($RawResults | Where-Object { $_.Type -eq "Orphan" }).Data
+$ScriptErrors = ($RawResults | Where-Object { $_.Type -eq "Error" }).Data
 
-# ------------------------------------------------------------
-# 4) Orphan Certificates
-# ------------------------------------------------------------
-$OrphanCerts = Invoke-Command -ComputerName $Targets -Credential $Credential -ScriptBlock {
-    Import-Module WebAdministration
+# Process Connection Errors (RPC/WinRM failures)
+if ($ConnErrors) {
+    $ConnErrorList = $ConnErrors | Select-Object @{N='ServerName';E={$_.TargetObject}}, @{N='Error';E={$_.Exception.Message}}
+}
 
-    $boundThumbs = Get-ChildItem IIS:\Sites |
-        ForEach-Object { $_.Bindings.Collection } |
-        Where-Object { $_.certificateHash } |
-        ForEach-Object {
-            ($_.certificateHash | ForEach-Object { $_.ToString("X2") }) -join ""
-        }
-
-    Get-ChildItem Cert:\LocalMachine\My |
-        Where-Object {
-            ($_.Thumbprint.Replace(" ", "").ToUpper()) -notin $boundThumbs
-        } |
-        Select-Object PSComputerName, Subject, Issuer, NotAfter, Thumbprint
-} -ErrorAction SilentlyContinue
+# Logic Checks
+$ExpiringCerts = $Inventory | Where-Object { $_.DaysLeft -ne $null -and $_.DaysLeft -le 60 }
+$BindingErrors = $Inventory | Where-Object { $_.Error -ne $null }
 
 # ------------------------------------------------------------
-# 5) Summary
+# 5) Summary Object
 # ------------------------------------------------------------
 $Summary = [pscustomobject]@{
-    RunID                = $RunID
-    RunDate              = $RunDate
-    ServersScanned       = $Targets.Count
-    IISInstalledCount    = ($Inventory | Where-Object IISInstalled | Select-Object -Expand ServerName -Unique).Count
-    IISNotInstalledCount = ($Inventory | Where-Object { -not $_.IISInstalled } | Select-Object -Expand ServerName -Unique).Count
-    TotalErrors          = $Errors.Count
-    ExpiringCerts        = $Expiring.Count
+    ScanDate        = $RunDate
+    TargetsTargeted = $Targets.Count
+    ServersReached  = ($Inventory.ServerName | Select-Object -Unique).Count
+    TotalSites      = $Inventory.Count
+    ExpiringCount   = $ExpiringCerts.Count
+    OrphanCount     = $Orphans.Count
+    FailedServers   = $ConnErrorList.Count
 }
 
-# ------------------------------------------------------------
-# 6) Excel Export
-# ------------------------------------------------------------
-$ExcelPath = Join-Path $OutputDir "IISentinel_Report_$TimeStamp.xlsx"
+Write-Host "------------------------------------------------"
+Write-Host " Scan Complete " 
+Write-Host " Expiring Certs (60d): $($Summary.ExpiringCount)" -ForegroundColor Yellow
+Write-Host " Orphan Certs:         $($Summary.OrphanCount)"
+Write-Host " Failed Connections:   $($Summary.FailedServers)" -ForegroundColor Red
+Write-Host "------------------------------------------------"
 
-$pkg = @{
-    Path          = $ExcelPath
-    AutoSize      = $true
-    BoldTopRow    = $true
-    FreezeTopRow  = $true
+# ------------------------------------------------------------
+# 6) Export Report
+# ------------------------------------------------------------
+$ExcelPath = Join-Path $OutputPath "IISentinel_Report_$TimeStamp.xlsx"
+$ExcelPkg  = @{ Path = $ExcelPath; AutoSize = $true; BoldTopRow = $true; FreezeTopRow = $true }
+
+# Create Sheets (Order matters)
+if ($Summary)       { $Summary       | Export-Excel @ExcelPkg -WorksheetName "Summary" }
+if ($ExpiringCerts) { $ExpiringCerts | Export-Excel @ExcelPkg -WorksheetName "Expiring_ActionReq" -TabColor Red }
+if ($Inventory)     { $Inventory     | Export-Excel @ExcelPkg -WorksheetName "All_Bindings" }
+if ($Orphans)       { $Orphans       | Export-Excel @ExcelPkg -WorksheetName "Orphan_Certs" }
+if ($ScriptErrors)  { $ScriptErrors  | Export-Excel @ExcelPkg -WorksheetName "IIS_Missing" }
+if ($ConnErrorList) { $ConnErrorList | Export-Excel @ExcelPkg -WorksheetName "Connection_Errors" }
+
+Write-Host "[+] Report saved: $ExcelPath" -ForegroundColor Green
+
+# ------------------------------------------------------------
+# 7) Email Notification
+# ------------------------------------------------------------
+if ($SendEmail) {
+    if (-not $To) { Write-Warning "SendEmail switch used but -To address is missing."; break }
+
+    Write-Host "[*] Sending email report..." -ForegroundColor Cyan
+
+    $Body = @"
+    <h2>IIS & SSL Inventory Report</h2>
+    <p><b>Date:</b> $($RunDate)</p>
+    <p><b>Output:</b> $ExcelPath</p>
+    
+    <table border="1" style="border-collapse:collapse; cellpadding:5;">
+        <tr><td style="background-color:#eee"><b>Servers Scanned</b></td><td>$($Summary.ServersReached) / $($Summary.TargetsTargeted)</td></tr>
+        <tr><td style="background-color:#eee"><b>Expiring Certs (<60d)</b></td><td><span style="color:red"><b>$($Summary.ExpiringCount)</b></span></td></tr>
+        <tr><td style="background-color:#eee"><b>Orphan Certs</b></td><td>$($Summary.OrphanCount)</td></tr>
+        <tr><td style="background-color:#eee"><b>Connection Errors</b></td><td>$($Summary.FailedServers)</td></tr>
+    </table>
+    <br>
+    <p><i>See attached Excel file for full details.</i></p>
+"@
+
+    $MsgParams = @{
+        To          = $To
+        From        = $From
+        Subject     = "$EmailSubject - $TimeStamp"
+        Body        = $Body
+        BodyAsHtml  = $true
+        SmtpServer  = $SmtpServer
+        Attachments = $ExcelPath
+    }
+
+    try {
+        Send-MailMessage @MsgParams
+        Write-Host "[+] Email sent successfully." -ForegroundColor Green
+    }
+    catch {
+        Write-Error "Failed to send email: $($_.Exception.Message)"
+    }
 }
-
-$Inventory   | Export-Excel @pkg -WorksheetName "Inventory"
-$Errors      | Export-Excel @pkg -WorksheetName "Errors"
-$Summary     | Export-Excel @pkg -WorksheetName "Summary"
-$OrphanCerts | Export-Excel @pkg -WorksheetName "OrphanCerts"
-
-Write-Host "[+] Excel report created: $ExcelPath" -ForegroundColor Green
