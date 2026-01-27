@@ -102,7 +102,7 @@ $RemoteScript = {
 
 Write-Host "[*] Scanning $($OnlineServers.Count) servers via WinRM..." -ForegroundColor Cyan
 # Throttling reduced to 25 to help with the "Network Interrupted" warnings
-$RawResults = Invoke-Command -ComputerName $OnlineServers -Credential $Credential -ScriptBlock $RemoteScript -ArgumentList $WarningDays -ThrottleLimit 25 -ErrorAction SilentlyContinue -ErrorVariable WinRMErrors
+$RawResults = Invoke-Command -ComputerName $OnlineServers -Credential $Credential -ScriptBlock $RemoteScript -ArgumentList $WarningDays -ThrottleLimit 15 -ErrorAction SilentlyContinue -ErrorVariable WinRMErrors
 
 $Inventory = ($RawResults | Where-Object { $_.Type -eq "Inv" }).Data
 $Orphans   = ($RawResults | Where-Object { $_.Type -eq "Orphan" }).Data
