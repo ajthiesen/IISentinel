@@ -213,16 +213,32 @@ $RemoteScript = {
 # ------------------------------------------------------------
 # 5) Run Inventory
 # ------------------------------------------------------------
-Write-Host "[*] Scanning $($OnlineServers.Count) online servers..." -ForegroundColor Cyan
+Write-Host "[*] Scanning $($OnlineServers.Count) online servers via WinRM..." -ForegroundColor Cyan
+
 $RawResults = Invoke-Command `
     -ComputerName $OnlineServers `
     -Credential $Credential `
     -ScriptBlock $RemoteScript `
     -ArgumentList $WarningDays `
-    -ThrottleLimit 20
+    -ThrottleLimit 32 `
+    -ErrorAction SilentlyContinue `
+    -ErrorVariable WinRMErrors
 
+# Process successful results
 $Inventory = ($RawResults | Where-Object { $_.Type -eq "Inventory" }).Data
 $Orphans   = ($RawResults | Where-Object { $_.Type -eq "Orphan" }).Data
+
+# Process WinRM Failures (like ATLT-SCERSQL)
+if ($WinRMErrors) {
+    foreach ($err in $WinRMErrors) {
+        $OfflineServers += [pscustomobject]@{ 
+            ServerName = $err.TargetObject
+            Error      = "WinRM Failed: $($err.Exception.Message.Split(".")[0])" # Shortens the long WinRM error
+        }
+    }
+}
+
+Write-Host "[+] Scan complete. Success: $($Inventory.ServerName | Select -Unique).Count, Failed: $($OfflineServers.Count)" -ForegroundColor Green
 
 # ------------------------------------------------------------
 # 6) Excel Export with Conditional Formatting
@@ -292,4 +308,4 @@ if ($SendEmail -and $To) {
     }
 }
 
-Write-Host "[!] Done." -ForegroundColor Cyan
+Write-Host "IISentinel Scan Complete." -ForegroundColor Cyan
