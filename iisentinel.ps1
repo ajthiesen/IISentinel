@@ -115,35 +115,44 @@ $SuccessCount = ($Inventory.ServerName | Select -Unique | Measure-Object).Count
 Write-Host "[+] Scan complete. Success: $SuccessCount, Failed: $($OfflineServers.Count)" -ForegroundColor Green
 
 # ------------------------------------------------------------
-# 4) Professional Excel Export (Multi-Sheet Stability Fix)
+# 4) Professional Excel Export (Final "Create" Fix)
 # ------------------------------------------------------------
 try {
-    if (Test-Path $ExcelPath) { Remove-Item $ExcelPath -Force }
+    # Clean start: If a file from a previous failed run exists, kill it.
+    if (Test-Path $ExcelPath) { Remove-Item $ExcelPath -Force -ErrorAction SilentlyContinue }
 
     Write-Host "[*] Initializing Excel Package..." -ForegroundColor Cyan
     
-    # 1. Open the package
-    $pkg = Open-ExcelPackage -Path $ExcelPath
+    # FIX: Added -Create switch to force the file/object into existence
+    $pkg = Open-ExcelPackage -Path $ExcelPath -Create
 
-    # 2. Pre-create the worksheets to avoid "Could not get worksheet" errors
+    # SAFETY CHECK: If $pkg is still null, stop here before the crash
+    if ($null -eq $pkg) {
+        throw "Failed to initialize Excel Package. Check permissions on $OutputPath"
+    }
+
+    # 1. Pre-create the worksheets (Prevents "Worksheet not found" errors)
     $null = Add-Worksheet -ExcelPackage $pkg -WorksheetName "Inventory"
     if ($Orphans) { $null = Add-Worksheet -ExcelPackage $pkg -WorksheetName "Orphaned_Certs" }
     if ($OfflineServers.Count -gt 0) { $null = Add-Worksheet -ExcelPackage $pkg -WorksheetName "Connection_Errors" }
 
-    # 3. Inject Data into pre-existing sheets
+    # 2. Inject Data
     Write-Host "[*] Populating report data..." -ForegroundColor Cyan
     
-    $Inventory | Export-Excel -ExcelPackage $pkg -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow -FreezeTopRow
+    if ($Inventory) {
+        $Inventory | Export-Excel -ExcelPackage $pkg -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow -FreezeTopRow
+    }
     
     if ($Orphans) {
-        $Orphans | Export-Excel -ExcelPackage $pkg -WorksheetName "Orphaned_Certs" -TableStyle Medium9 -AutoSize
+        $Orphans | Export-Excel -ExcelPackage $ExcelPackage -WorksheetName "Orphaned_Certs" -TableStyle Medium9 -AutoSize
     }
 
     if ($OfflineServers.Count -gt 0) {
         $OfflineServers | Export-Excel -ExcelPackage $pkg -WorksheetName "Connection_Errors" -TableStyle Medium1 -AutoSize
     }
 
-    # 4. Apply Conditional Formatting
+    # 3. Apply Conditional Formatting
+    # Using the direct Workbook reference is the most stable method
     $invSheet = $pkg.Workbook.Worksheets["Inventory"]
     if ($null -ne $invSheet) {
         # Column F is 'DaysLeft'
@@ -151,12 +160,13 @@ try {
         Add-ConditionalFormatting -Worksheet $invSheet -Address "F:F" -RuleType LessThan -ConditionValue $WarningDays -ForegroundColor Black -BackgroundColor Yellow
     }
 
-    # 5. Save and Close
+    # 4. Save and Close
     Close-ExcelPackage -ExcelPackage $pkg
     Write-Host "[+] Professional report saved: $ExcelPath" -ForegroundColor Green
 }
 catch {
     Write-Error "Excel Export Failed: $($_.Exception.Message)"
+    # Clean up the object to release the file lock if we crashed
     if ($null -ne $pkg) { Close-ExcelPackage -ExcelPackage $pkg -NoSave }
 }
 
