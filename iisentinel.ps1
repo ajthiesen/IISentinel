@@ -52,72 +52,69 @@ foreach ($Server in $Targets) {
 $RemoteScript = {
     param($WarningDays)
     $ErrorActionPreference = "SilentlyContinue"
-    Import-Module WebAdministration
+    
+    # 1. Ensure Module is loaded
+    if (-not (Get-Module WebAdministration)) { Import-Module WebAdministration }
     
     function Norm-Thumb ($t) { if($t){$t.Replace(" ","").Replace(":","").ToUpper()} }
     
+    # 2. AGGRESSIVE Certificate Mapping
+    # We now recurse the entire LocalMachine hive to find certs in ANY store
     $certMap = @{}
-    Get-ChildItem Cert:\LocalMachine\My, Cert:\LocalMachine\WebHosting | ForEach-Object { $certMap[(Norm-Thumb $_.Thumbprint)] = $_ }
+    Get-ChildItem Cert:\LocalMachine -Recurse | Where-Object { $_.Thumbprint } | ForEach-Object {
+        if (-not $certMap.ContainsKey($_.Thumbprint)) {
+            $certMap[$_.Thumbprint] = $_
+        }
+    }
     
     $results = @()
+    # Using the IIS: drive is often more reliable than Get-WebBinding for certain configs
     $sites = Get-ChildItem IIS:\Sites
     foreach ($site in $sites) {
         foreach ($bind in $site.Bindings.Collection) {
             $certData = $null; $risk = @(); $grade = "A"; $guidance = "No action required."
             
             if ($bind.protocol -eq "https") {
+                # Attempt to get Hash
                 $hash = Norm-Thumb (($bind.certificateHash | ForEach-Object { $_.ToString("X2") }) -join "")
+                
+                # If hash is blank, try to find it via the SSL Binding Store (SNI Support)
+                if ([string]::IsNullOrEmpty($hash)) {
+                    $sniPath = "IIS:\SslBindings\*!$($bind.bindingInformation.Split(':')[1])"
+                    $hash = (Get-Item $sniPath).Thumbprint | ForEach-Object { Norm-Thumb $_ }
+                }
+
                 if ($hash -and $certMap.ContainsKey($hash)) {
                     $c = $certMap[$hash]
-                    
-                    # --- SAN Extraction Logic ---
-                    $sanList = ""
-                    $sanExtension = $c.Extensions | Where-Object { $_.Oid.FriendlyName -match "Subject Alternative Name" }
-                    if ($sanExtension) {
-                        $sanList = ($sanExtension.Format($false) -split "," | ForEach-Object { $_.Trim().Replace("DNS Name=", "") }) -join ", "
-                    }
-                    
                     $ks = if ($c.PublicKey.Key.KeySize) { $c.PublicKey.Key.KeySize } else { 0 }
                     $days = [math]::Round(($c.NotAfter-(Get-Date)).TotalDays)
                     
+                    # SAN Expansion
+                    $sanList = ""
+                    $sanExt = $c.Extensions | Where-Object { $_.Oid.FriendlyName -match "Subject Alternative Name" }
+                    if ($sanExt) { $sanList = ($sanExt.Format($false) -split "," | ForEach-Object { $_.Trim().Replace("DNS Name=", "") }) -join ", " }
+
                     # Audit Logic
-                    if ($days -lt 0) { $grade = "F"; $guidance = "EXPIRED: Replace certificate immediately." }
-                    elseif ($days -lt 30) { 
-                        if ($grade -ne "F") { $grade = "B" }
-                        $guidance = "EXPIRING SOON: Renew within 30 days." 
-                    }
+                    if ($days -lt 0) { $grade = "F"; $guidance = "EXPIRED: Replace immediately." }
+                    elseif ($days -lt 30) { $grade = "B"; $guidance = "Renew within 30 days." }
                     
-                    if ($c.SignatureAlgorithm.FriendlyName -match "sha1") { 
-                        $grade = "C"; $risk += "SHA1"; $guidance = "WEAK CRYPTO: Re-issue using SHA256." 
-                    }
-                    if ($ks -gt 0 -and $ks -lt 2048) { 
-                        $grade = "C"; $risk += "WeakKey($ks)"; $guidance = "WEAK KEY: Re-issue with 2048-bit minimum." 
-                    }
-                    
-                    # Missing SAN Check (The Fixed Line)
-                    if (-not $sanList) { 
-                        $risk += "Missing-SAN"
-                        if ($grade -ne "F") { $grade = "C" }
-                        $guidance = "MODERN COMPLIANCE: Cert missing SAN field. Re-issue." 
-                    }
+                    if ($c.SignatureAlgorithm.FriendlyName -match "sha1") { $grade = "C"; $risk += "SHA1" }
+                    if ($ks -gt 0 -and $ks -lt 2048) { $grade = "C"; $risk += "WeakKey($ks)" }
                     
                     $certData = [pscustomobject]@{ Subject=$c.Subject; SAN=$sanList; DaysLeft=$days; KeySize=$ks }
                 } else {
-                    $grade = "F"; $guidance = "CRITICAL: HTTPS Binding exists but Certificate is MISSING from Store."
+                    # If we STILL can't find it, it's a genuine error or elevation issue
+                    $grade = "F"; $guidance = "CRITICAL: Cert Thumbprint not found in Local Stores. Check if cert was deleted or moved."
                 }
             }
             
             $parts = $bind.bindingInformation -split ":"
             $results += [pscustomobject]@{ Type="Inv"; Data=[pscustomobject]@{ 
-                ServerName  = $env:COMPUTERNAME; 
-                SiteName    = $site.Name; 
-                Port        = $parts[1]; 
-                CertSubject = if($certData){$certData.Subject}else{"N/A"}; 
-                SAN         = if($certData){$certData.SAN}else{"N/A"};
-                DaysLeft    = if($certData){$certData.DaysLeft}else{$null}; 
-                Grade       = $grade; 
-                Risk        = ($risk -join ", "); 
-                Guidance    = $guidance 
+                ServerName=$env:COMPUTERNAME; SiteName=$site.Name; Port=$parts[1]; 
+                CertSubject=if($certData){$certData.Subject}else{"N/A"}; 
+                SAN=if($certData){$certData.SAN}else{"N/A"};
+                DaysLeft=if($certData){$certData.DaysLeft}else{$null}; 
+                Grade=$grade; Risk=($risk -join ", "); Guidance=$guidance 
             } }
         }
     }
