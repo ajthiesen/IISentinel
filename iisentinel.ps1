@@ -102,7 +102,7 @@ $RemoteScript = {
 
 Write-Host "[*] Scanning $($OnlineServers.Count) servers via WinRM..." -ForegroundColor Cyan
 # Throttling reduced to 25 to help with the "Network Interrupted" warnings
-$RawResults = Invoke-Command -ComputerName $OnlineServers -Credential $Credential -ScriptBlock $RemoteScript -ArgumentList $WarningDays -ThrottleLimit 15 -ErrorAction SilentlyContinue -ErrorVariable WinRMErrors
+$RawResults = Invoke-Command -ComputerName $OnlineServers -Credential $Credential -ScriptBlock $RemoteScript -ArgumentList $WarningDays -ThrottleLimit 25 -ErrorAction SilentlyContinue -ErrorVariable WinRMErrors
 
 $Inventory = ($RawResults | Where-Object { $_.Type -eq "Inv" }).Data
 $Orphans   = ($RawResults | Where-Object { $_.Type -eq "Orphan" }).Data
@@ -115,37 +115,36 @@ $SuccessCount = ($Inventory.ServerName | Select -Unique | Measure-Object).Count
 Write-Host "[+] Scan complete. Success: $SuccessCount, Failed: $($OfflineServers.Count)" -ForegroundColor Green
 
 # ------------------------------------------------------------
-# 4) Professional Excel Export (Final Stability Fix)
+# 4) Professional Excel Export (Multi-Sheet Stability Fix)
 # ------------------------------------------------------------
 try {
-    # Ensure a fresh start
     if (Test-Path $ExcelPath) { Remove-Item $ExcelPath -Force }
 
-    Write-Host "[*] Creating Excel Report..." -ForegroundColor Cyan
+    Write-Host "[*] Initializing Excel Package..." -ForegroundColor Cyan
+    
+    # 1. Open the package
+    $pkg = Open-ExcelPackage -Path $ExcelPath
 
-    # 1. Create the file and the first sheet simultaneously
-    # This ensures $pkg is never null.
-    $pkg = $Inventory | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" `
-        -TableStyle Medium2 -AutoSize -BoldTopRow -FreezeTopRow -PassThru
+    # 2. Pre-create the worksheets to avoid "Could not get worksheet" errors
+    $null = Add-Worksheet -ExcelPackage $pkg -WorksheetName "Inventory"
+    if ($Orphans) { $null = Add-Worksheet -ExcelPackage $pkg -WorksheetName "Orphaned_Certs" }
+    if ($OfflineServers.Count -gt 0) { $null = Add-Worksheet -ExcelPackage $pkg -WorksheetName "Connection_Errors" }
 
-    Start-Sleep -Milliseconds 500
-
-    # 2. Add Orphans if they exist
+    # 3. Inject Data into pre-existing sheets
+    Write-Host "[*] Populating report data..." -ForegroundColor Cyan
+    
+    $Inventory | Export-Excel -ExcelPackage $pkg -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow -FreezeTopRow
+    
     if ($Orphans) {
-        $Orphans | Export-Excel -ExcelPackage $pkg -WorksheetName "Orphaned_Certs" `
-            -TableStyle Medium9 -AutoSize
-        Start-Sleep -Milliseconds 200
+        $Orphans | Export-Excel -ExcelPackage $pkg -WorksheetName "Orphaned_Certs" -TableStyle Medium9 -AutoSize
     }
 
-    # 3. Add Connection Errors if they exist
     if ($OfflineServers.Count -gt 0) {
-        $OfflineServers | Export-Excel -ExcelPackage $pkg -WorksheetName "Connection_Errors" `
-            -TableStyle Medium1 -AutoSize
-        Start-Sleep -Milliseconds 200
+        $OfflineServers | Export-Excel -ExcelPackage $pkg -WorksheetName "Connection_Errors" -TableStyle Medium1 -AutoSize
     }
 
     # 4. Apply Conditional Formatting
-    $invSheet = $pkg.Workbook.Worksheets | Where-Object { $_.Name -eq "Inventory" }
+    $invSheet = $pkg.Workbook.Worksheets["Inventory"]
     if ($null -ne $invSheet) {
         # Column F is 'DaysLeft'
         Add-ConditionalFormatting -Worksheet $invSheet -Address "F:F" -RuleType LessThan -ConditionValue 30 -ForegroundColor White -BackgroundColor Red
@@ -158,7 +157,6 @@ try {
 }
 catch {
     Write-Error "Excel Export Failed: $($_.Exception.Message)"
-    # Clean up if possible
     if ($null -ne $pkg) { Close-ExcelPackage -ExcelPackage $pkg -NoSave }
 }
 
