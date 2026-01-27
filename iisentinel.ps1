@@ -228,16 +228,34 @@ $Orphans   = ($RawResults | Where-Object { $_.Type -eq "Orphan" }).Data
 # 6) Excel Export with Conditional Formatting
 # ------------------------------------------------------------
 $ExcelPath = Join-Path $OutputPath "IISentinel_Report_$TimeStamp.xlsx"
-$pkg = $Inventory | Export-Excel -Path $ExcelPath -WorksheetName "All_Bindings" -AutoSize -BoldTopRow -FreezeTopRow -PassThru
 
-# Apply Formatting: Red for < 30 days, Yellow for < WarningDays
-Add-ConditionalFormatting -Worksheet $pkg.All_Bindings -Address "H:H" -RuleType LessThan -ConditionValue 30 -ForegroundColor White -BackgroundColor Red
-Add-ConditionalFormatting -Worksheet $pkg.All_Bindings -Address "H:H" -RuleType LessThan -ConditionValue $WarningDays -ForegroundColor Black -BackgroundColor Yellow
+# Use 'Open-ExcelPackage' to manage multiple sheets more reliably
+$ExcelPackage = Open-ExcelPackage -Path $ExcelPath
 
-if ($Orphans) { $Orphans | Export-Excel -ExcelPackage $pkg -WorksheetName "Orphan_Certs" }
-if ($OfflineServers) { $OfflineServers | Export-Excel -ExcelPackage $pkg -WorksheetName "Offline_Servers" }
+# 1. Export Inventory
+$Inventory | Export-Excel -ExcelPackage $ExcelPackage -WorksheetName "All_Bindings" -AutoSize -BoldTopRow -FreezeTopRow
 
-Close-ExcelPackage $pkg
+# 2. Export Orphans (if any)
+if ($Orphans) { 
+    $Orphans | Export-Excel -ExcelPackage $ExcelPackage -WorksheetName "Orphan_Certs" -AutoSize -BoldTopRow 
+}
+
+# 3. Export Offline Servers (if any)
+if ($OfflineServers.Count -gt 0) { 
+    $OfflineServers | Export-Excel -ExcelPackage $ExcelPackage -WorksheetName "Offline_Servers" -AutoSize -BoldTopRow 
+}
+
+# 4. Apply Conditional Formatting to the Inventory Sheet
+$InvSheet = $ExcelPackage.Workbook.Worksheets["All_Bindings"]
+if ($InvSheet) {
+    # H:H is usually the 'DaysLeft' column. 
+    # Note: If you changed the property order, double check the column letter!
+    Add-ConditionalFormatting -Worksheet $InvSheet -Address "H:H" -RuleType LessThan -ConditionValue 30 -ForegroundColor White -BackgroundColor Red
+    Add-ConditionalFormatting -Worksheet $InvSheet -Address "H:H" -RuleType LessThan -ConditionValue $WarningDays -ForegroundColor Black -BackgroundColor Yellow
+}
+
+# 5. Save and Close
+Close-ExcelPackage -ExcelPackage $ExcelPackage
 Write-Host "[+] Report created: $ExcelPath" -ForegroundColor Green
 
 # ------------------------------------------------------------
