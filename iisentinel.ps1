@@ -122,53 +122,59 @@ $TopRiskServers = $Inventory | Where-Object { $_.Grade -eq "F" } | Group-Object 
                   Select-Object @{Name="Server";Expression={$_.Name}}, @{Name="CriticalIssues";Expression={$_.Count}} | 
                   Sort-Object CriticalIssues -Descending | Select -First 5
 
-# ------------------------------------------------------------
-# 5) Branded Excel Export
-# ------------------------------------------------------------
-# 5) Branded Excel Export (Passthru Edition)
+# 5) Branded Excel Export (Final "Bulletproof" Version)
 try {
-    if (Test-Path $ExcelPath) { Remove-Object $ExcelPath -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $ExcelPath) { Remove-Item $ExcelPath -Force -ErrorAction SilentlyContinue }
     Write-Host "[*] Building Executive Dashboard..." -ForegroundColor Cyan
 
-    # Start the Excel Package
-    $ExcelPackage = $Inventory | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow -PassThru
+    # 1. Initialize the Package
+    $ExcelPackage = Open-ExcelPackage -Path $ExcelPath
 
-    # A) Add the Dashboard Sheet
+    # 2. Create the Dashboard Sheet first (Ensures it exists for the "Move" command later)
+    $dashSheet = Add-Worksheet -ExcelPackage $ExcelPackage -WorksheetName "Dashboard"
+    
+    # 3. Add Dashboard Data
     $DashboardInfo = @(
         [pscustomobject]@{ "Security Metric" = "Fleet Health Score"; "Status" = $HealthScore }
         [pscustomobject]@{ "Security Metric" = "Total HTTPS Sites Audited"; "Status" = $TotalSites }
         [pscustomobject]@{ "Security Metric" = "Critical Failures (Grade F)"; "Status" = ($Inventory | Where-Object {$_.Grade -eq "F"}).Count }
     )
-    # We use the -ExcelPackage parameter to stay in the same file
-    $DashboardInfo | Export-Excel -ExcelPackage $ExcelPackage -WorksheetName "Dashboard" -Title "FLEET SECURITY POSTURE" -TitleBold -TitleSize 16
     
-    # Add the Grade Summary Table to the Dashboard
-    $SummaryStats | Export-Excel -ExcelPackage $ExcelPackage -WorksheetName "Dashboard" -StartRow 7 -TableName "GradeSummary"
+    Export-Excel -ExcelPackage $ExcelPackage -WorksheetName "Dashboard" -Data $DashboardInfo -Title "FLEET SECURITY POSTURE" -TitleBold -TitleSize 16
+    Export-Excel -ExcelPackage $ExcelPackage -WorksheetName "Dashboard" -Data $SummaryStats -StartRow 7 -TableName "GradeSummary"
     
-    # Add Top Risk Servers to the Dashboard
     if ($TopRiskServers) {
-        $TopRiskServers | Export-Excel -ExcelPackage $ExcelPackage -WorksheetName "Dashboard" -StartRow 7 -StartColumn 6 -TableName "TopRisks"
+        Export-Excel -ExcelPackage $ExcelPackage -WorksheetName "Dashboard" -Data $TopRiskServers -StartRow 7 -StartColumn 6 -TableName "TopRisks"
     }
 
-    # B) Add Connectivity Errors if any
+    # 4. Add Inventory Sheet
+    if ($Inventory) {
+        $Inventory | Sort-Object Grade -Descending | 
+            Export-Excel -ExcelPackage $ExcelPackage -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow
+    }
+
+    # 5. Add Connectivity Errors Sheet
     if ($OfflineServers) {
         $OfflineServers | Export-Excel -ExcelPackage $ExcelPackage -WorksheetName "Connectivity_Errors" -TableStyle Medium1 -AutoSize
     }
 
-    # C) Final Formatting & Set Dashboard as Active
-    $dashSheet = $ExcelPackage.Workbook.Worksheets["Dashboard"]
-    $invSheet  = $ExcelPackage.Workbook.Worksheets["Inventory"]
+    # 6. Final Formatting Pass
+    Write-Host "[*] Finalizing Excel tabs and colors..." -ForegroundColor Cyan
+    $invSheet = $ExcelPackage.Workbook.Worksheets["Inventory"]
     
-    # Move Dashboard to the front (Index 1)
+    # Ensure Dashboard is the Active Tab
     $ExcelPackage.Workbook.Worksheets.MoveToStart("Dashboard")
-    $dashSheet.View.TabSelected = $true
-    $invSheet.View.TabSelected = $false
+    $ExcelPackage.Workbook.Worksheets["Dashboard"].View.TabSelected = $true
+    if ($invSheet) { $invSheet.View.TabSelected = $false }
 
-    # Apply Conditional Formatting to Inventory Grade Column (Column F)
-    Add-ConditionalFormatting -Worksheet $invSheet -Address "F:F" -RuleType Equal -ConditionValue "A" -ForegroundColor White -BackgroundColor Green
-    Add-ConditionalFormatting -Worksheet $invSheet -Address "F:F" -RuleType Equal -ConditionValue "F" -ForegroundColor White -BackgroundColor Red
+    # Apply Conditional Formatting to Inventory (Column F is Grade)
+    if ($invSheet) {
+        Add-ConditionalFormatting -Worksheet $invSheet -Address "F:F" -RuleType Equal -ConditionValue "A" -ForegroundColor White -BackgroundColor Green
+        Add-ConditionalFormatting -Worksheet $invSheet -Address "F:F" -RuleType Equal -ConditionValue "B" -ForegroundColor Black -BackgroundColor Yellow
+        Add-ConditionalFormatting -Worksheet $invSheet -Address "F:F" -RuleType Equal -ConditionValue "F" -ForegroundColor White -BackgroundColor Red
+    }
 
-    # Save and Close
+    # 7. Save and Close
     Close-ExcelPackage -ExcelPackage $ExcelPackage
     Write-Host "[+] Executive Audit saved: $ExcelPath" -ForegroundColor Green
 }
