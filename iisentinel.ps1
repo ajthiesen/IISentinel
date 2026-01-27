@@ -1,8 +1,7 @@
 <#
 .SYNOPSIS
-    IISentinel Pro v3.1 - Full Security & Protocol Auditor
-    Restored: Full Discovery, SAN, Domain Analysis, Remediation.
-    Added: TLS 1.0/1.1 Detection, Protocol Drift, Stable Export.
+    IISentinel Pro v3.1.1 - Full Security & Protocol Auditor
+    Fix: Added Zero-count protection for Health Score and Analytics.
 #>
 
 [CmdletBinding()]
@@ -25,7 +24,7 @@ $RunDate = Get-Date
 $TimeStamp = $RunDate.ToString("yyyyMMdd-HHmm")
 $ExcelPath = Join-Path $OutputPath "IISentinel_Security_Audit_$TimeStamp.xlsx"
 
-# 2) Full Discovery Logic (Restored)
+# 2) Full Discovery Logic
 Write-Host "[*] Discovering targets..." -ForegroundColor Cyan
 $Targets = [System.Collections.Generic.List[string]]::new()
 if ($ServerNames) { $Targets.AddRange($ServerNames) }
@@ -42,13 +41,13 @@ $OnlineServers = $UniqueTargets | Where-Object { Test-Connection -ComputerName $
 
 if (-not $OnlineServers) { Write-Error "No servers responded to ping. Exiting."; return }
 
-# 3) Remote Audit Logic (Full Restored + TLS Add-on)
+# 3) Remote Audit Logic
 $RemoteScript = {
     param($WarningDays)
     Import-Module WebAdministration -ErrorAction SilentlyContinue
     function Norm-Thumb ($t) { if($t){$t.Replace(" ","").Replace(":","").ToUpper()} }
     
-    # TLS Check
+    # TLS 1.0/1.1 Registry Check
     $tls10 = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0\Server" -Name Enabled -ErrorAction SilentlyContinue
     $tls11 = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1\Server" -Name Enabled -ErrorAction SilentlyContinue
     $weakTLS = ($tls10.Enabled -eq 1 -or $tls11.Enabled -eq 1)
@@ -82,8 +81,6 @@ $RemoteScript = {
 
                 if ($hash -and $certMap.ContainsKey($hash)) {
                     $c = $certMap[$hash]; $days = [math]::Round(($c.NotAfter-(Get-Date)).TotalDays)
-                    
-                    # SAN Expansion
                     $sanList = ""
                     $sanExt = $c.Extensions | Where-Object { $_.Oid.FriendlyName -match "Subject Alternative Name" }
                     if ($sanExt) { $sanList = ($sanExt.Format($false) -split "," | ForEach-Object { $_.Trim().Replace("DNS Name=", "") }) -join ", " }
@@ -115,44 +112,58 @@ $RemoteScript = {
 Write-Host "[*] Auditing $($OnlineServers.Count) servers via WinRM..." -ForegroundColor Cyan
 $Inventory = Invoke-Command -ComputerName $OnlineServers -Credential $Credential -ScriptBlock $RemoteScript -ArgumentList $WarningDays -ThrottleLimit 20 -ErrorAction SilentlyContinue | Select-Object ServerName, SiteName, Protocol, Port, CertSubject, SAN, DaysLeft, Grade, Remediation, Risk
 
-# 4) Analytics
-$DomainSummary = $Inventory | Where-Object { $_.CertSubject -ne "N/A" } | Group-Object CertSubject | 
-                 Select-Object @{N="Certificate Domain";E={$_.Name}}, @{N="UsageCount";E={$_.Count}} | 
-                 Sort-Object UsageCount -Descending | Select-Object -First 10
+# 4) Analytics with Zero-Proof Logic
+$TotalSites = if ($Inventory) { $Inventory.Count } else { 0 }
 
-$HealthScore = "{0:P0}" -f (($Inventory | Where-Object {$_.Grade -match "A|B"}).Count / $Inventory.Count)
+if ($TotalSites -gt 0) {
+    $HealthScoreValue = ($Inventory | Where-Object { $_.Grade -match "A|B" }).Count / $TotalSites
+    $HealthScore = "{0:P0}" -f $HealthScoreValue
+    
+    $DomainSummary = $Inventory | Where-Object { $_.CertSubject -ne "N/A" } | Group-Object CertSubject | 
+                     Select-Object @{N="Certificate Domain";E={$_.Name}}, @{N="UsageCount";E={$_.Count}} | 
+                     Sort-Object UsageCount -Descending | Select-Object -First 10
+} else {
+    $HealthScore = "0%"
+    $DomainSummary = @()
+}
 
 $DashboardData = @(
     [pscustomobject]@{ "Metric" = "Fleet Health Score"; "Value" = $HealthScore }
-    [pscustomobject]@{ "Metric" = "Total Bindings Audited"; "Value" = $Inventory.Count }
-    [pscustomobject]@{ "Metric" = "Total Security Issues (C/F)"; "Value" = ($Inventory | Where-Object {$_.Grade -match "C|F"}).Count }
+    [pscustomobject]@{ "Metric" = "Total Bindings Audited"; "Value" = $TotalSites }
+    [pscustomobject]@{ "Metric" = "Total Security Issues (C/F)"; "Value" = if($Inventory){($Inventory | Where-Object {$_.Grade -match "C|F"}).Count}else{0} }
 )
 
-# 5) Consolidated Export (One-Pass, No re-opening)
+# 5) Consolidated Export
 try {
     Write-Host "[*] Saving Comprehensive Security Audit..." -ForegroundColor Cyan
     
-    # First sheet establishes the file
-    $Pkg = $Inventory | Sort-Object Grade -Descending | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow -PassThru
-    
-    # Add Dashboard
-    $DashboardData | Export-Excel -ExcelPackage $Pkg -WorksheetName "Dashboard" -Title "POSTURE SUMMARY" -TitleBold -TitleSize 16 -AutoSize
-    
-    # Add Domain Analysis
-    $DomainSummary | Export-Excel -ExcelPackage $Pkg -WorksheetName "Dashboard" -StartRow 7 -TableName "DomainUsage" -AutoSize
+    if ($TotalSites -eq 0) {
+        Write-Warning "No IIS HTTPS bindings were found. Creating empty report."
+        $DashboardData | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -AutoSize
+    } else {
+        # Inventory First
+        $Pkg = $Inventory | Sort-Object Grade -Descending | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow -PassThru
+        
+        # Dashboard
+        $DashboardData | Export-Excel -ExcelPackage $Pkg -WorksheetName "Dashboard" -Title "POSTURE SUMMARY" -TitleBold -TitleSize 16 -AutoSize
+        
+        # Domain Summary
+        if ($DomainSummary) {
+            $DomainSummary | Export-Excel -ExcelPackage $Pkg -WorksheetName "Dashboard" -StartRow 7 -TableName "DomainUsage" -AutoSize
+        }
 
-    # Cleanup & Formatting
-    $Pkg.Workbook.Worksheets.MoveToStart("Dashboard")
-    $Pkg.Workbook.Worksheets["Dashboard"].View.TabSelected = $true
-    
-    $invSheet = $Pkg.Workbook.Worksheets["Inventory"]
-    if ($invSheet) {
-        # Column H is Grade in this full layout
-        Add-ConditionalFormatting -Worksheet $invSheet -Address "H:H" -RuleType Equal -ConditionValue "A" -ForegroundColor White -BackgroundColor Green
-        Add-ConditionalFormatting -Worksheet $invSheet -Address "H:H" -RuleType Equal -ConditionValue "C" -ForegroundColor Black -BackgroundColor Orange
-        Add-ConditionalFormatting -Worksheet $invSheet -Address "H:H" -RuleType Equal -ConditionValue "F" -ForegroundColor White -BackgroundColor Red
+        # Final Touches
+        $Pkg.Workbook.Worksheets.MoveToStart("Dashboard")
+        $Pkg.Workbook.Worksheets["Dashboard"].View.TabSelected = $true
+        
+        $invSheet = $Pkg.Workbook.Worksheets["Inventory"]
+        if ($invSheet) {
+            Add-ConditionalFormatting -Worksheet $invSheet -Address "H:H" -RuleType Equal -ConditionValue "A" -ForegroundColor White -BackgroundColor Green
+            Add-ConditionalFormatting -Worksheet $invSheet -Address "H:H" -RuleType Equal -ConditionValue "C" -ForegroundColor Black -BackgroundColor Orange
+            Add-ConditionalFormatting -Worksheet $invSheet -Address "H:H" -RuleType Equal -ConditionValue "F" -ForegroundColor White -BackgroundColor Red
+        }
+        
+        Close-ExcelPackage -ExcelPackage $Pkg
     }
-    
-    Close-ExcelPackage -ExcelPackage $Pkg
     Write-Host "[+] Success! Report saved: $ExcelPath" -ForegroundColor Green
 } catch { Write-Error "Export failed: $($_.Exception.Message)" }
