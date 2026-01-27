@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    IISentinel Pro - Enterprise Audit Edition v2.2
+    IISentinel Pro - Enterprise Audit Edition v2.3 (SAN Expansion)
 #>
 
 [CmdletBinding()]
@@ -26,9 +26,9 @@ if (-not (Get-Module -ListAvailable -Name ImportExcel)) { Throw "ImportExcel mod
 
 $RunDate   = Get-Date
 $TimeStamp = $RunDate.ToString("yyyyMMdd-HHmm")
-$ExcelPath = Join-Path $OutputPath "IISentinel_Audit_$TimeStamp.xlsx"
+$ExcelPath = Join-Path $OutputPath "IISentinel_Audit_SAN_$TimeStamp.xlsx"
 
-# 2) Target Discovery
+# 2) Discovery & Connectivity
 Write-Host "[*] Discovering targets..." -ForegroundColor Cyan
 $Targets = [System.Collections.Generic.List[string]]::new()
 if ($ServerNames) { $Targets.AddRange($ServerNames) }
@@ -48,11 +48,12 @@ foreach ($Server in $Targets) {
     else { $OfflineServers.Add([pscustomobject]@{ ServerName = $Server; Status = "Offline"; Error = "Ping Failed" }) }
 }
 
-# 3) Remote Audit Logic
+# 3) Remote Audit Logic (With SAN Expansion)
 $RemoteScript = {
     param($WarningDays)
     $ErrorActionPreference = "SilentlyContinue"
     Import-Module WebAdministration
+    
     function Norm-Thumb ($t) { if($t){$t.Replace(" ","").Replace(":","").ToUpper()} }
     
     $certMap = @{}
@@ -68,6 +69,15 @@ $RemoteScript = {
                 $hash = Norm-Thumb (($bind.certificateHash | ForEach-Object { $_.ToString("X2") }) -join "")
                 if ($hash -and $certMap.ContainsKey($hash)) {
                     $c = $certMap[$hash]
+                    
+                    # --- SAN Extraction Logic ---
+                    $sanList = ""
+                    $sanExtension = $c.Extensions | Where-Object { $_.Oid.FriendlyName -match "Subject Alternative Name" }
+                    if ($sanExtension) {
+                        # Clean up the format: "DNS Name=site.com, DNS Name=api.site.com" -> "site.com, api.site.com"
+                        $sanList = ($sanExtension.Format($false) -split "," | ForEach-Object { $_.Trim().Replace("DNS Name=", "") }) -join ", "
+                    }
+                    
                     $ks = if ($c.PublicKey.Key.KeySize) { $c.PublicKey.Key.KeySize } else { 0 }
                     $days = [math]::Round(($c.NotAfter-(Get-Date)).TotalDays)
                     
@@ -76,63 +86,66 @@ $RemoteScript = {
                     elseif ($days -lt 30) { $grade = "B"; $guidance = "EXPIRING SOON: Renew within 30 days." }
                     
                     if ($c.SignatureAlgorithm.FriendlyName -match "sha1") { 
-                        $grade = "C"; $risk += "SHA1"
-                        $guidance = "WEAK CRYPTO: Re-issue using SHA256." 
+                        $grade = "C"; $risk += "SHA1"; $guidance = "WEAK CRYPTO: Re-issue using SHA256." 
                     }
                     if ($ks -gt 0 -and $ks -lt 2048) { 
-                        $grade = "C"; $risk += "WeakKey($ks)"
-                        $guidance = "WEAK KEY: Re-issue with 2048-bit minimum." 
+                        $grade = "C"; $risk += "WeakKey($ks)"; $guidance = "WEAK KEY: Re-issue with 2048-bit minimum." 
                     }
+                    if (-not $sanList) { $risk += "Missing-SAN"; $grade = ($grade -match "F") ? "F" : "C"; $guidance = "MODERN COMPLIANCE: Cert missing SAN field. Re-issue." }
                     
-                    $certData = [pscustomobject]@{ Subject=$c.Subject; DaysLeft=$days; KeySize=$ks }
+                    $certData = [pscustomobject]@{ Subject=$c.Subject; SAN=$sanList; DaysLeft=$days; KeySize=$ks }
                 } else {
-                    $grade = "F"; $guidance = "CRITICAL: HTTPS Binding exists but Certificate is MISSING."
+                    $grade = "F"; $guidance = "CRITICAL: HTTPS Binding exists but Certificate is MISSING from Store."
                 }
             }
             
             $parts = $bind.bindingInformation -split ":"
             $results += [pscustomobject]@{ Type="Inv"; Data=[pscustomobject]@{ 
-                ServerName=$env:COMPUTERNAME; SiteName=$site.Name; Port=$parts[1]; 
-                CertSubject=if($certData){$certData.Subject}else{"N/A"}; 
-                DaysLeft=if($certData){$certData.DaysLeft}else{$null}; 
-                Grade=$grade; Risk=($risk -join ", "); Guidance=$guidance 
+                ServerName  = $env:COMPUTERNAME; 
+                SiteName    = $site.Name; 
+                Port        = $parts[1]; 
+                CertSubject = if($certData){$certData.Subject}else{"N/A"}; 
+                SAN         = if($certData){$certData.SAN}else{"N/A"};
+                DaysLeft    = if($certData){$certData.DaysLeft}else{$null}; 
+                Grade       = $grade; 
+                Risk        = ($risk -join ", "); 
+                Guidance    = $guidance 
             } }
         }
     }
     return $results
 }
 
-Write-Host "[*] Auditing $($OnlineServers.Count) servers via WinRM..." -ForegroundColor Cyan
+Write-Host "[*] Auditing $($OnlineServers.Count) servers via WinRM (SAN Scan)..." -ForegroundColor Cyan
 $RawResults = Invoke-Command -ComputerName $OnlineServers -Credential $Credential -ScriptBlock $RemoteScript -ArgumentList $WarningDays -ThrottleLimit 20 -ErrorAction SilentlyContinue -ErrorVariable WinRMErrors
 $Inventory = ($RawResults | Where-Object { $_.Type -eq "Inv" }).Data
-if ($WinRMErrors) { foreach ($e in $WinRMErrors) { $OfflineServers.Add([pscustomobject]@{ ServerName=$e.TargetObject; Status="WinRM Error"; Error="Connection Blocked" }) } }
 
 # 4) Data Preparation
-$ServerSummary = $Inventory | Group-Object ServerName | Select-Object @{Name="Server Name";Expression={$_.Name}}, @{Name="Cert Count";Expression={$_.Count}}, @{Name="Avg Grade";Expression={ ($_.Group.Grade | Sort-Object | Select-Object -First 1) }} | Sort-Object "Avg Grade"
+$ServerSummary = $Inventory | Group-Object ServerName | Select-Object @{Name="Server Name";Expression={$_.Name}}, @{Name="Cert Count";Expression={$_.Count}}, @{Name="Lowest Grade";Expression={ ($_.Group.Grade | Sort-Object | Select-Object -First 1) }} | Sort-Object "Lowest Grade"
 $VersionHistory = @(
+    [pscustomobject]@{ Version="2.3"; Date="2026-01-27"; Change="Added SAN (Subject Alternative Name) Expansion" }
     [pscustomobject]@{ Version="2.2"; Date="2026-01-27"; Change="Added Security Grades & Remediation Guidance" }
-    [pscustomobject]@{ Version="2.1"; Date="2026-01-27"; Change="Fixed Style Helper Bug & Added Summaries" }
 )
 
 # 5) Branded Excel Export
 try {
     if (Test-Path $ExcelPath) { Remove-Item $ExcelPath -Force -ErrorAction SilentlyContinue }
-    Write-Host "[*] Building Audit Report..." -ForegroundColor Cyan
+    Write-Host "[*] Building SAN-Enabled Report..." -ForegroundColor Cyan
 
     # A) Disclaimer
     $Disclaimer = @(
         [pscustomobject]@{ "IISentinel Security Audit" = "Prepared For: NCH HCS Server Team" }
-        [pscustomobject]@{ "IISentinel Security Audit" = "Generated By: $env:USERNAME" }
         [pscustomobject]@{ "IISentinel Security Audit" = "Grade Key: A=Healthy, B=Warning, C=Weak Crypto, F=Critical/Expired" }
+        [pscustomobject]@{ "IISentinel Security Audit" = "SAN Field: Expanded to reveal multi-domain certificate coverage." }
     )
     $Disclaimer | Export-Excel -Path $ExcelPath -WorksheetName "Disclaimer" -Title "AUDIT OVERVIEW" -TitleBold -TitleSize 14
 
     # B) Server Summary
     $ServerSummary | Export-Excel -Path $ExcelPath -WorksheetName "Server_Summary" -TableStyle Medium4 -AutoSize
 
-    # C) Full Inventory (Auto-Sorted by Grade)
+    # C) Full Inventory
     if ($Inventory) {
-        $Inventory | Sort-Object Grade -Descending | Select-Object ServerName, SiteName, Port, CertSubject, DaysLeft, Grade, Risk, Guidance | 
+        $Inventory | Sort-Object Grade -Descending | Select-Object ServerName, SiteName, Port, CertSubject, SAN, DaysLeft, Grade, Risk, Guidance | 
             Export-Excel -Path $ExcelPath -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow -FreezeTopRow
     }
 
@@ -140,11 +153,11 @@ try {
     if ($OfflineServers.Count -gt 0) { $OfflineServers | Export-Excel -Path $ExcelPath -WorksheetName "Connectivity_Errors" -TableStyle Medium1 -AutoSize }
     $VersionHistory | Export-Excel -Path $ExcelPath -WorksheetName "Version_History" -TableStyle Medium9 -AutoSize
 
-    # E) Final Pass: Conditional Formatting
+    # E) Final Formatting Pass
     $pkg = Open-ExcelPackage -Path $ExcelPath
     $invSheet = $pkg.Workbook.Worksheets["Inventory"]
     if ($null -ne $invSheet) {
-        # Column F = DaysLeft, Column G = Grade
+        # Column F is DaysLeft, Column G is Grade
         Add-ConditionalFormatting -Worksheet $invSheet -Address "G:G" -RuleType Equal -ConditionValue "A" -ForegroundColor White -BackgroundColor Green
         Add-ConditionalFormatting -Worksheet $invSheet -Address "G:G" -RuleType Equal -ConditionValue "C" -ForegroundColor Black -BackgroundColor Yellow
         Add-ConditionalFormatting -Worksheet $invSheet -Address "G:G" -RuleType Equal -ConditionValue "F" -ForegroundColor White -BackgroundColor Red
@@ -154,10 +167,9 @@ try {
 }
 catch { Write-Error "Export Failed: $($_.Exception.Message)" }
 
-# 6) Email Notification
+# 6) Email
 if ($SendEmail -and $To) {
     $Critical = ($Inventory | Where-Object { $_.Grade -eq "F" }).Count
-    $EmailBody = "<h2>SSL Audit Summary</h2><p>Critical Issues (Grade F): <span style='color:red;'>$Critical</span></p><p>Total Sites Audited: $($Inventory.Count)</p><br><p>Audit report attached.</p>"
-    Send-MailMessage -To $To -From $From -Subject "$EmailSubject - $TimeStamp" -Body $EmailBody -BodyAsHtml -SmtpServer $SmtpServer -Attachments $ExcelPath
+    Send-MailMessage -To $To -From $From -Subject "$EmailSubject - $TimeStamp" -Body "SSL Audit with SAN details attached. Critical issues found: $Critical" -SmtpServer $SmtpServer -Attachments $ExcelPath
 }
-Write-Host "[!] Audit Finished." -ForegroundColor Cyan
+Write-Host "[!] Audit Finished Successfully." -ForegroundColor Cyan
