@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    IISentinel Pro - IIS & SSL Inventory
+    IISentinel Pro - IIS & SSL Inventory (Final TableStyle Fix)
 #>
 
 [CmdletBinding()]
@@ -101,7 +101,8 @@ $RemoteScript = {
 }
 
 Write-Host "[*] Scanning $($OnlineServers.Count) servers via WinRM..." -ForegroundColor Cyan
-$RawResults = Invoke-Command -ComputerName $OnlineServers -Credential $Credential -ScriptBlock $RemoteScript -ArgumentList $WarningDays -ThrottleLimit 40 -ErrorAction SilentlyContinue -ErrorVariable WinRMErrors
+# Throttling reduced to 25 to help with the "Network Interrupted" warnings
+$RawResults = Invoke-Command -ComputerName $OnlineServers -Credential $Credential -ScriptBlock $RemoteScript -ArgumentList $WarningDays -ThrottleLimit 25 -ErrorAction SilentlyContinue -ErrorVariable WinRMErrors
 
 $Inventory = ($RawResults | Where-Object { $_.Type -eq "Inv" }).Data
 $Orphans   = ($RawResults | Where-Object { $_.Type -eq "Orphan" }).Data
@@ -117,35 +118,27 @@ Write-Host "[+] Scan complete. Success: $SuccessCount, Failed: $($OfflineServers
 # 4) Professional Excel Export
 # ------------------------------------------------------------
 try {
-    # Delete file if it exists to prevent corruption/locks from previous failed runs
     if (Test-Path $ExcelPath) { Remove-Item $ExcelPath -Force }
 
-    $ExcelParams = @{
-        Path          = $ExcelPath
-        AutoSize      = $true
-        TableStyle    = "TableStyleMedium2"
-        BoldTopRow    = $true
-        FreezeTopRow  = $true
-    }
+    # Changed TableStyle names to match your module's specific enumerator requirements
+    $pkg = $Inventory | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" `
+        -TableStyle Medium2 -AutoSize -BoldTopRow -FreezeTopRow -PassThru
 
-    # Export main inventory
-    $pkg = $Inventory | Export-Excel @ExcelParams -WorksheetName "Inventory" -PassThru
-
-    # Safely add Orphan sheet
     if ($Orphans) {
-        $Orphans | Export-Excel -ExcelPackage $pkg -WorksheetName "Orphaned_Certs" -TableStyle "TableStyleMedium9"
+        $Orphans | Export-Excel -ExcelPackage $pkg -WorksheetName "Orphaned_Certs" -TableStyle Medium9 -AutoSize
     }
 
-    # Safely add Offline/Errors sheet
     if ($OfflineServers.Count -gt 0) {
-        $OfflineServers | Export-Excel -ExcelPackage $pkg -WorksheetName "Connection_Errors" -TableStyle "TableStyleMedium1"
+        $OfflineServers | Export-Excel -ExcelPackage $pkg -WorksheetName "Connection_Errors" -TableStyle Medium1 -AutoSize
     }
 
-    # Apply Conditional Formatting to 'Inventory'
+    # Conditional Formatting logic
     $invSheet = $pkg.Workbook.Worksheets["Inventory"]
-    # In the exported object, DaysLeft is the 6th column (F)
-    Add-ConditionalFormatting -Worksheet $invSheet -Address "F:F" -RuleType LessThan -ConditionValue 30 -ForegroundColor White -BackgroundColor Red
-    Add-ConditionalFormatting -Worksheet $invSheet -Address "F:F" -RuleType LessThan -ConditionValue $WarningDays -ForegroundColor Black -BackgroundColor Yellow
+    if ($invSheet) {
+        # Column F is DaysLeft
+        Add-ConditionalFormatting -Worksheet $invSheet -Address "F:F" -RuleType LessThan -ConditionValue 30 -ForegroundColor White -BackgroundColor Red
+        Add-ConditionalFormatting -Worksheet $invSheet -Address "F:F" -RuleType LessThan -ConditionValue $WarningDays -ForegroundColor Black -BackgroundColor Yellow
+    }
 
     Close-ExcelPackage -ExcelPackage $pkg
     Write-Host "[+] Professional report saved: $ExcelPath" -ForegroundColor Green
