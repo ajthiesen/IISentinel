@@ -109,50 +109,48 @@ if ($WinRMErrors) {
 $SuccessCount = ($Inventory.ServerName | Select -Unique | Measure-Object).Count
 Write-Host "[+] Scan complete. Success: $SuccessCount, Failed: $($OfflineServers.Count)" -ForegroundColor Green
 
-# 4) Professional Excel Export
+# ------------------------------------------------------------
+# 4) Professional Excel Export (Linear Recovery Version)
+# ------------------------------------------------------------
 try {
     if (Test-Path $ExcelPath) { Remove-Item $ExcelPath -Force -ErrorAction SilentlyContinue }
 
-    Write-Host "[*] Initializing Excel Package..." -ForegroundColor Cyan
-    $pkg = Open-ExcelPackage -Path $ExcelPath -Create
-
-    if ($null -eq $pkg) { throw "Excel object failed to initialize." }
-
-    # Create sheets
-    $null = Add-Worksheet -ExcelPackage $pkg -WorksheetName "Inventory"
-    if ($Orphans) { $null = Add-Worksheet -ExcelPackage $pkg -WorksheetName "Orphaned_Certs" }
-    if ($OfflineServers.Count -gt 0) { $null = Add-Worksheet -ExcelPackage $pkg -WorksheetName "Connection_Errors" }
-
-    Write-Host "[*] Populating report data..." -ForegroundColor Cyan
+    Write-Host "[*] Creating Excel Sheets..." -ForegroundColor Cyan
     
-    # Inventory
+    # Step 1: Create the file with the Inventory sheet
     if ($Inventory) {
-        $Inventory | Export-Excel -ExcelPackage $pkg -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow -FreezeTopRow
+        $Inventory | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" `
+            -TableStyle Medium2 -AutoSize -BoldTopRow -FreezeTopRow
     }
-    
-    # Orphans
+
+    # Step 2: Add Orphans to the existing file
     if ($Orphans) {
-        $Orphans | Export-Excel -ExcelPackage $pkg -WorksheetName "Orphaned_Certs" -TableStyle Medium9 -AutoSize
+        $Orphans | Export-Excel -Path $ExcelPath -WorksheetName "Orphaned_Certs" `
+            -TableStyle Medium9 -AutoSize
     }
 
-    # Errors
+    # Step 3: Add Connection Errors to the existing file
     if ($OfflineServers.Count -gt 0) {
-        $OfflineServers | Export-Excel -ExcelPackage $pkg -WorksheetName "Connection_Errors" -TableStyle Medium1 -AutoSize
+        $OfflineServers | Export-Excel -Path $ExcelPath -WorksheetName "Connection_Errors" `
+            -TableStyle Medium1 -AutoSize
     }
 
-    # Formatting
-    $invSheet = $pkg.Workbook.Worksheets["Inventory"]
+    # Step 4: Final Pass for Formatting
+    # We open it one last time just to apply the colors
+    Write-Host "[*] Applying final formatting..." -ForegroundColor Cyan
+    $finalPkg = Open-ExcelPackage -Path $ExcelPath
+    $invSheet = $finalPkg.Workbook.Worksheets["Inventory"]
+    
     if ($null -ne $invSheet) {
         Add-ConditionalFormatting -Worksheet $invSheet -Address "F:F" -RuleType LessThan -ConditionValue 30 -ForegroundColor White -BackgroundColor Red
         Add-ConditionalFormatting -Worksheet $invSheet -Address "F:F" -RuleType LessThan -ConditionValue $WarningDays -ForegroundColor Black -BackgroundColor Yellow
     }
-
-    Close-ExcelPackage -ExcelPackage $pkg
-    Write-Host "[+] Professional report saved: $ExcelPath" -ForegroundColor Green
+    
+    Close-ExcelPackage -ExcelPackage $finalPkg
+    Write-Host "[+] Success! Report saved: $ExcelPath" -ForegroundColor Green
 }
 catch {
     Write-Error "Excel Export Failed: $($_.Exception.Message)"
-    if ($null -ne $pkg) { Close-ExcelPackage -ExcelPackage $pkg -NoSave }
 }
 
 # 5) Email Summary
