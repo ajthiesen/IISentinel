@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-    IISentinel Pro v3.1.2 - Data Recovery & Full Auditor
-    Fix: Forced module loading and direct provider access to ensure data return.
+    IISentinel Pro v3.1.3 - Data Recovery & Full Auditor
+    Fix: Replaced .ToString("X2") with BitConverter for network resilience.
 #>
 
 [CmdletBinding()]
@@ -24,7 +24,7 @@ $RunDate = Get-Date
 $TimeStamp = $RunDate.ToString("yyyyMMdd-HHmm")
 $ExcelPath = Join-Path $OutputPath "IISentinel_Security_Audit_$TimeStamp.xlsx"
 
-# 2) Full Discovery Logic
+# 2) Discovery
 Write-Host "[*] Discovering targets..." -ForegroundColor Cyan
 $Targets = [System.Collections.Generic.List[string]]::new()
 if ($ServerNames) { $Targets.AddRange($ServerNames) }
@@ -41,40 +41,30 @@ $OnlineServers = $UniqueTargets | Where-Object { Test-Connection -ComputerName $
 
 if (-not $OnlineServers) { Write-Error "No servers responded to ping."; return }
 
-# 3) Remote Audit Logic (Hardened)
+# 3) Remote Audit Logic (Resilient Version)
 $RemoteScript = {
     param($WarningDays)
     $results = @()
-    # Force load the module or use the WebAdministration drive directly
-    if (-not (Get-Module -Name WebAdministration)) {
-        Import-Module WebAdministration -ErrorAction SilentlyContinue
-    }
-    
-    # Validation Check: If IIS provider isn't available, we can't scan
-    if (-not (Test-Path IIS:\Sites)) {
-        return [pscustomobject]@{ ServerName=$env:COMPUTERNAME; SiteName="ERROR"; Protocol="IIS_NOT_FOUND"; Port="N/A"; Grade="F"; Remediation="IIS Module failed to load or IIS not installed."; Risk="ConfigError" }
-    }
+    if (-not (Get-Module -Name WebAdministration)) { Import-Module WebAdministration -ErrorAction SilentlyContinue }
+    if (-not (Test-Path IIS:\Sites)) { return $null }
 
-    function Norm-Thumb ($t) { if($t){$t.Replace(" ","").Replace(":","").ToUpper()} }
-    
     # TLS Check
     $tls10 = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0\Server" -Name Enabled -ErrorAction SilentlyContinue
     $tls11 = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1\Server" -Name Enabled -ErrorAction SilentlyContinue
     $weakTLS = ($tls10.Enabled -eq 1 -or $tls11.Enabled -eq 1)
 
+    # Pre-index Certificates
     $certMap = @{}
     Get-ChildItem Cert:\LocalMachine -Recurse | Where-Object { $_.Thumbprint } | ForEach-Object {
         if (-not $certMap.ContainsKey($_.Thumbprint)) { $certMap[$_.Thumbprint] = $_ }
     }
     
-    $sites = Get-ChildItem IIS:\Sites
-    foreach ($site in $sites) {
+    foreach ($site in (Get-ChildItem IIS:\Sites)) {
         $hasHttps = $false; $hasHttp = $false
         $redirect = (Get-WebConfigurationProperty -pspath "IIS:\Sites\$($site.Name)" -filter "system.webServer/httpRedirect" -name "enabled").Value
 
         foreach ($bind in $site.Bindings.Collection) {
-            $parts = $bind.bindingInformation -split ":"
-            $port = $parts[1]
+            $port = ($bind.bindingInformation -split ":")[1]
             $grade = "A"; $guidance = "Healthy"; $risk = @(); $certData = $null
             
             if ($bind.protocol -eq "https") {
@@ -82,10 +72,15 @@ $RemoteScript = {
                 if ($port -ne "443") { $grade = "B"; $risk += "NonStandardPort" }
                 if ($weakTLS) { $grade = "C"; $risk += "WeakTLS" }
 
-                $hash = Norm-Thumb (($bind.certificateHash | ForEach-Object { $_.ToString("X2") }) -join "")
+                # ROBUST HASH CONVERSION: BitConverter is safer than .ToString("X2") over flaky networks
+                $hash = ""
+                if ($bind.certificateHash) {
+                    $hash = [System.BitConverter]::ToString($bind.certificateHash).Replace("-","").ToUpper()
+                }
+
                 if ([string]::IsNullOrEmpty($hash)) {
                     $sni = Get-Item "IIS:\SslBindings\*!$port" -ErrorAction SilentlyContinue
-                    $hash = Norm-Thumb $sni.Thumbprint
+                    $hash = $sni.Thumbprint
                 }
 
                 if ($hash -and $certMap.ContainsKey($hash)) {
@@ -97,7 +92,7 @@ $RemoteScript = {
                     if ($days -lt 0) { $grade = "F"; $guidance = "EXPIRED" }
                     elseif ($days -lt 30) { $grade = "B"; $guidance = "Renew Soon" }
                     $certData = [pscustomobject]@{ Sub=$c.Subject; SAN=$sanList; Days=$days }
-                } else { $grade = "F"; $guidance = "Cert missing." }
+                } else { $grade = "F"; $guidance = "Cert Missing" }
             }
             elseif ($bind.protocol -eq "http") { $hasHttp = $true }
 
@@ -115,14 +110,14 @@ $RemoteScript = {
             }
         }
     }
-    # Fallback: If a server has sites but none were HTTPS, at least return the HTTP sites so we know it scanned
     return $results
 }
 
 Write-Host "[*] Auditing $($OnlineServers.Count) servers via WinRM..." -ForegroundColor Cyan
-# Capture the output into an array explicitly
-$RawInventory = Invoke-Command -ComputerName $OnlineServers -Credential $Credential -ScriptBlock $RemoteScript -ArgumentList $WarningDays -ThrottleLimit 20 
-$Inventory = $RawInventory | Select-Object ServerName, SiteName, Protocol, Port, CertSubject, SAN, DaysLeft, Grade, Remediation, Risk
+# Run the command and filter out nulls/errors immediately
+$Inventory = Invoke-Command -ComputerName $OnlineServers -Credential $Credential -ScriptBlock $RemoteScript -ArgumentList $WarningDays -ThrottleLimit 20 -ErrorAction SilentlyContinue | 
+             Where-Object { $_ -ne $null } | 
+             Select-Object ServerName, SiteName, Protocol, Port, CertSubject, SAN, DaysLeft, Grade, Remediation, Risk
 
 # 4) Analytics
 $TotalSites = if ($Inventory) { $Inventory.Count } else { 0 }
@@ -133,19 +128,19 @@ if ($TotalSites -gt 0) {
                      Select-Object @{N="Certificate Domain";E={$_.Name}}, @{N="UsageCount";E={$_.Count}} | 
                      Sort-Object UsageCount -Descending | Select-Object -First 10
 } else {
-    $HealthScore = "0%"; $DomainSummary = @()
+    Write-Error "Inventory scan returned no data. Check WinRM permissions."
+    return
 }
 
 $DashboardData = @(
     [pscustomobject]@{ "Metric" = "Fleet Health Score"; "Value" = $HealthScore }
     [pscustomobject]@{ "Metric" = "Total Bindings Audited"; "Value" = $TotalSites }
-    [pscustomobject]@{ "Metric" = "Security Issues (C/F)"; "Value" = if($Inventory){($Inventory | Where-Object {$_.Grade -match "C|F"}).Count}else{0} }
+    [pscustomobject]@{ "Metric" = "Security Issues (C/F)"; "Value" = ($Inventory | Where-Object {$_.Grade -match "C|F"}).Count }
 )
 
-# 5) Consolidated Export
+# 5) Export
 try {
-    Write-Host "[*] Saving Comprehensive Security Audit..." -ForegroundColor Cyan
-    # Build everything in one pass to avoid the Range error
+    Write-Host "[*] Saving Security Audit Report..." -ForegroundColor Cyan
     $Pkg = $Inventory | Sort-Object Grade -Descending | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow -PassThru
     $DashboardData | Export-Excel -ExcelPackage $Pkg -WorksheetName "Dashboard" -Title "POSTURE SUMMARY" -TitleBold -TitleSize 16 -AutoSize
     if ($DomainSummary) { $DomainSummary | Export-Excel -ExcelPackage $Pkg -WorksheetName "Dashboard" -StartRow 7 -TableName "DomainUsage" -AutoSize }
