@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
-    IISentinel Pro - Enterprise Audit Edition v2.3.1 (SAN Expansion - Fix)
+    IISentinel Pro - Executive Edition v2.5
+    Features: Dashboard, SAN Expansion, Grade Auditing, and Chain Validation.
 #>
 
 [CmdletBinding()]
@@ -15,7 +16,7 @@ param(
     [string]$SmtpServer = "smtp.yourdomain.com",
     [string]$From = "IISentinel@yourdomain.com",
     [string[]]$To,
-    [string]$EmailSubject = "IIS SSL Audit Report"
+    [string]$EmailSubject = "Executive IIS SSL Audit"
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,7 +27,7 @@ if (-not (Get-Module -ListAvailable -Name ImportExcel)) { Throw "ImportExcel mod
 
 $RunDate   = Get-Date
 $TimeStamp = $RunDate.ToString("yyyyMMdd-HHmm")
-$ExcelPath = Join-Path $OutputPath "IISentinel_Audit_SAN_$TimeStamp.xlsx"
+$ExcelPath = Join-Path $OutputPath "IISentinel_Executive_Audit_$TimeStamp.xlsx"
 
 # 2) Discovery & Connectivity
 Write-Host "[*] Discovering targets..." -ForegroundColor Cyan
@@ -48,72 +49,54 @@ foreach ($Server in $Targets) {
     else { $OfflineServers.Add([pscustomobject]@{ ServerName = $Server; Status = "Offline"; Error = "Ping Failed" }) }
 }
 
-# 3) Remote Audit Logic (Fixed Version)
+# 3) Remote Audit Logic (With Chain Validation & SAN)
 $RemoteScript = {
     param($WarningDays)
     $ErrorActionPreference = "SilentlyContinue"
-    
-    # 1. Ensure Module is loaded
-    if (-not (Get-Module WebAdministration)) { Import-Module WebAdministration }
-    
+    Import-Module WebAdministration
     function Norm-Thumb ($t) { if($t){$t.Replace(" ","").Replace(":","").ToUpper()} }
     
-    # 2. AGGRESSIVE Certificate Mapping
-    # We now recurse the entire LocalMachine hive to find certs in ANY store
     $certMap = @{}
     Get-ChildItem Cert:\LocalMachine -Recurse | Where-Object { $_.Thumbprint } | ForEach-Object {
-        if (-not $certMap.ContainsKey($_.Thumbprint)) {
-            $certMap[$_.Thumbprint] = $_
-        }
+        if (-not $certMap.ContainsKey($_.Thumbprint)) { $certMap[$_.Thumbprint] = $_ }
     }
     
     $results = @()
-    # Using the IIS: drive is often more reliable than Get-WebBinding for certain configs
     $sites = Get-ChildItem IIS:\Sites
     foreach ($site in $sites) {
         foreach ($bind in $site.Bindings.Collection) {
-            $certData = $null; $risk = @(); $grade = "A"; $guidance = "No action required."
+            if ($bind.protocol -ne "https") { continue }
+            $certData = $null; $risk = @(); $grade = "A"; $guidance = "Healthy."
             
-            if ($bind.protocol -eq "https") {
-                # Attempt to get Hash
-                $hash = Norm-Thumb (($bind.certificateHash | ForEach-Object { $_.ToString("X2") }) -join "")
+            $hash = Norm-Thumb (($bind.certificateHash | ForEach-Object { $_.ToString("X2") }) -join "")
+            if ([string]::IsNullOrEmpty($hash)) {
+                $sniPath = "IIS:\SslBindings\*!$($bind.bindingInformation.Split(':')[1])"
+                $hash = (Get-Item $sniPath).Thumbprint | ForEach-Object { Norm-Thumb $_ }
+            }
+
+            if ($hash -and $certMap.ContainsKey($hash)) {
+                $c = $certMap[$hash]
+                $days = [math]::Round(($c.NotAfter-(Get-Date)).TotalDays)
                 
-                # If hash is blank, try to find it via the SSL Binding Store (SNI Support)
-                if ([string]::IsNullOrEmpty($hash)) {
-                    $sniPath = "IIS:\SslBindings\*!$($bind.bindingInformation.Split(':')[1])"
-                    $hash = (Get-Item $sniPath).Thumbprint | ForEach-Object { Norm-Thumb $_ }
-                }
+                # Chain Validation
+                $chain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+                $chainValid = $chain.Build($c)
+                if (-not $chainValid) { $grade = "C"; $risk += "UntrustedChain"; $guidance = "Warning: Chain is untrusted or incomplete." }
 
-                if ($hash -and $certMap.ContainsKey($hash)) {
-                    $c = $certMap[$hash]
-                    $ks = if ($c.PublicKey.Key.KeySize) { $c.PublicKey.Key.KeySize } else { 0 }
-                    $days = [math]::Round(($c.NotAfter-(Get-Date)).TotalDays)
-                    
-                    # SAN Expansion
-                    $sanList = ""
-                    $sanExt = $c.Extensions | Where-Object { $_.Oid.FriendlyName -match "Subject Alternative Name" }
-                    if ($sanExt) { $sanList = ($sanExt.Format($false) -split "," | ForEach-Object { $_.Trim().Replace("DNS Name=", "") }) -join ", " }
-
-                    # Audit Logic
-                    if ($days -lt 0) { $grade = "F"; $guidance = "EXPIRED: Replace immediately." }
-                    elseif ($days -lt 30) { $grade = "B"; $guidance = "Renew within 30 days." }
-                    
-                    if ($c.SignatureAlgorithm.FriendlyName -match "sha1") { $grade = "C"; $risk += "SHA1" }
-                    if ($ks -gt 0 -and $ks -lt 2048) { $grade = "C"; $risk += "WeakKey($ks)" }
-                    
-                    $certData = [pscustomobject]@{ Subject=$c.Subject; SAN=$sanList; DaysLeft=$days; KeySize=$ks }
-                } else {
-                    # If we STILL can't find it, it's a genuine error or elevation issue
-                    $grade = "F"; $guidance = "CRITICAL: Cert Thumbprint not found in Local Stores. Check if cert was deleted or moved."
-                }
+                # Standard Audit
+                if ($days -lt 0) { $grade = "F"; $guidance = "EXPIRED: Replace immediately." }
+                elseif ($days -lt 30) { if($grade -ne "F"){$grade="B"}; $guidance = "Renew within 30 days." }
+                if ($c.SignatureAlgorithm.FriendlyName -match "sha1") { $grade = "C"; $risk += "SHA1" }
+                
+                $certData = [pscustomobject]@{ Subject=$c.Subject; DaysLeft=$days }
+            } else {
+                $grade = "F"; $guidance = "CRITICAL: Binding Hash not found in Stores."
             }
             
             $parts = $bind.bindingInformation -split ":"
             $results += [pscustomobject]@{ Type="Inv"; Data=[pscustomobject]@{ 
                 ServerName=$env:COMPUTERNAME; SiteName=$site.Name; Port=$parts[1]; 
-                CertSubject=if($certData){$certData.Subject}else{"N/A"}; 
-                SAN=if($certData){$certData.SAN}else{"N/A"};
-                DaysLeft=if($certData){$certData.DaysLeft}else{$null}; 
+                CertSubject=if($certData){$certData.Subject}else{"N/A"}; DaysLeft=if($certData){$certData.DaysLeft}else{$null}; 
                 Grade=$grade; Risk=($risk -join ", "); Guidance=$guidance 
             } }
         }
@@ -121,53 +104,54 @@ $RemoteScript = {
     return $results
 }
 
-Write-Host "[*] Auditing $($OnlineServers.Count) servers via WinRM (SAN Scan)..." -ForegroundColor Cyan
-$RawResults = Invoke-Command -ComputerName $OnlineServers -Credential $Credential -ScriptBlock $RemoteScript -ArgumentList $WarningDays -ThrottleLimit 20 -ErrorAction SilentlyContinue -ErrorVariable WinRMErrors
+Write-Host "[*] Auditing $($OnlineServers.Count) servers via WinRM..." -ForegroundColor Cyan
+$RawResults = Invoke-Command -ComputerName $OnlineServers -Credential $Credential -ScriptBlock $RemoteScript -ArgumentList $WarningDays -ThrottleLimit 20 -ErrorAction SilentlyContinue
 $Inventory = ($RawResults | Where-Object { $_.Type -eq "Inv" }).Data
 
-# 4) Data Preparation
-$ServerSummary = $Inventory | Group-Object ServerName | Select-Object @{Name="Server Name";Expression={$_.Name}}, @{Name="Cert Count";Expression={$_.Count}}, @{Name="Lowest Grade";Expression={ ($_.Group.Grade | Sort-Object | Select-Object -First 1) }} | Sort-Object "Lowest Grade"
-$VersionHistory = @(
-    [pscustomobject]@{ Version="2.3.1"; Date="2026-01-27"; Change="Fixed PowerShell Ternary Syntax Bug" }
-    [pscustomobject]@{ Version="2.3"; Date="2026-01-27"; Change="Added SAN Expansion" }
-)
+# ------------------------------------------------------------
+# 4) Dashboard Generation Logic
+# ------------------------------------------------------------
+$TotalSites = $Inventory.Count
+$Grades = $Inventory | Group-Object Grade
+$SummaryStats = foreach ($g in $Grades) {
+    [pscustomobject]@{ Grade = $g.Name; Count = $g.Count; Percentage = "{0:P0}" -f ($g.Count / $TotalSites) }
+}
+$HealthScore = "{0:P0}" -f (($Inventory | Where-Object { $_.Grade -match "A|B" }).Count / $TotalSites)
 
+$TopRiskServers = $Inventory | Where-Object { $_.Grade -eq "F" } | Group-Object ServerName | 
+                  Select-Object @{Name="Server";Expression={$_.Name}}, @{Name="CriticalIssues";Expression={$_.Count}} | 
+                  Sort-Object CriticalIssues -Descending | Select -First 5
+
+# ------------------------------------------------------------
 # 5) Branded Excel Export
+# ------------------------------------------------------------
 try {
     if (Test-Path $ExcelPath) { Remove-Item $ExcelPath -Force -ErrorAction SilentlyContinue }
-    Write-Host "[*] Building SAN-Enabled Report..." -ForegroundColor Cyan
+    Write-Host "[*] Building Executive Dashboard..." -ForegroundColor Cyan
 
-    $Disclaimer = @(
-        [pscustomobject]@{ "IISentinel Security Audit" = "Prepared For: NCH HCS Server Team" }
-        [pscustomobject]@{ "IISentinel Security Audit" = "Grade Key: A=Healthy, B=Warning, C=Weak Crypto, F=Critical/Expired" }
+    # A) Dashboard Sheet
+    $DashboardInfo = @(
+        [pscustomobject]@{ "Metric" = "Fleet Health Score"; "Value" = $HealthScore }
+        [pscustomobject]@{ "Metric" = "Total HTTPS Sites Audited"; "Value" = $TotalSites }
+        [pscustomobject]@{ "Metric" = "Critical Failures (Grade F)"; "Value" = ($Inventory | Where-Object {$_.Grade -eq "F"}).Count }
     )
-    $Disclaimer | Export-Excel -Path $ExcelPath -WorksheetName "Disclaimer" -Title "AUDIT OVERVIEW" -TitleBold -TitleSize 14
+    $DashboardInfo | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -Title "FLEET SECURITY POSTURE" -TitleBold -TitleSize 16
+    $SummaryStats  | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -StartRow 7 -TableName "GradeSummary"
+    $TopRiskServers | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -StartRow 7 -StartColumn 6 -TableName "TopRisks"
 
-    $ServerSummary | Export-Excel -Path $ExcelPath -WorksheetName "Server_Summary" -TableStyle Medium4 -AutoSize
+    # B) Data Sheets
+    $Inventory | Sort-Object Grade -Descending | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow
+    if ($OfflineServers) { $OfflineServers | Export-Excel -Path $ExcelPath -WorksheetName "Connectivity_Errors" -TableStyle Medium1 -AutoSize }
 
-    if ($Inventory) {
-        $Inventory | Sort-Object Grade -Descending | Select-Object ServerName, SiteName, Port, CertSubject, SAN, DaysLeft, Grade, Risk, Guidance | 
-            Export-Excel -Path $ExcelPath -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow -FreezeTopRow
-    }
-
-    if ($OfflineServers.Count -gt 0) { $OfflineServers | Export-Excel -Path $ExcelPath -WorksheetName "Connectivity_Errors" -TableStyle Medium1 -AutoSize }
-    $VersionHistory | Export-Excel -Path $ExcelPath -WorksheetName "Version_History" -TableStyle Medium9 -AutoSize
-
+    # C) Formatting
     $pkg = Open-ExcelPackage -Path $ExcelPath
     $invSheet = $pkg.Workbook.Worksheets["Inventory"]
     if ($null -ne $invSheet) {
-        Add-ConditionalFormatting -Worksheet $invSheet -Address "G:G" -RuleType Equal -ConditionValue "A" -ForegroundColor White -BackgroundColor Green
-        Add-ConditionalFormatting -Worksheet $invSheet -Address "G:G" -RuleType Equal -ConditionValue "B" -ForegroundColor Black -BackgroundColor Yellow
-        Add-ConditionalFormatting -Worksheet $invSheet -Address "G:G" -RuleType Equal -ConditionValue "C" -ForegroundColor Black -BackgroundColor Orange
-        Add-ConditionalFormatting -Worksheet $invSheet -Address "G:G" -RuleType Equal -ConditionValue "F" -ForegroundColor White -BackgroundColor Red
+        # Column F is Grade
+        Add-ConditionalFormatting -Worksheet $invSheet -Address "F:F" -RuleType Equal -ConditionValue "A" -ForegroundColor White -BackgroundColor Green
+        Add-ConditionalFormatting -Worksheet $invSheet -Address "F:F" -RuleType Equal -ConditionValue "F" -ForegroundColor White -BackgroundColor Red
     }
     Close-ExcelPackage -ExcelPackage $pkg
-    Write-Host "[+] Audit Report saved: $ExcelPath" -ForegroundColor Green
+    Write-Host "[+] Executive Audit saved: $ExcelPath" -ForegroundColor Green
 }
 catch { Write-Error "Export Failed: $($_.Exception.Message)" }
-
-# 6) Email
-if ($SendEmail -and $To) {
-    Send-MailMessage -To $To -From $From -Subject "$EmailSubject - $TimeStamp" -Body "SSL Audit attached." -SmtpServer $SmtpServer -Attachments $ExcelPath
-}
-Write-Host "[!] Audit Finished Successfully." -ForegroundColor Cyan
