@@ -200,19 +200,13 @@ $SuccessCount = ($Inventory.ServerName | Select-Object -Unique | Measure-Object)
 Write-Host "[+] Scan complete. Success: $SuccessCount, Failed: $($OfflineServers.Count)" -ForegroundColor Green
 
 # ------------------------------------------------------------
-# 6) Excel Export
+# 6) Excel Export (Robust Version)
 # ------------------------------------------------------------
 try {
-    $ExcelPackage = Open-ExcelPackage -Path $ExcelPath -Create
-    
-    if ($Inventory) {
-        $Inventory | Export-Excel -ExcelPackage $ExcelPackage -WorksheetName "Inventory" -AutoSize -BoldTopRow
-        $sheet = $ExcelPackage.Workbook.Worksheets["Inventory"]
-        # Column F is 'DaysLeft' in this object structure
-        Add-ConditionalFormatting -Worksheet $sheet -Address "F:F" -RuleType LessThan -ConditionValue 30 -ForegroundColor White -BackgroundColor Red
-        Add-ConditionalFormatting -Worksheet $sheet -Address "F:F" -RuleType LessThan -ConditionValue $WarningDays -ForegroundColor Black -BackgroundColor Yellow
-    }
+    # 1. Create the package and add the data
+    $ExcelPackage = $Inventory | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" -AutoSize -BoldTopRow -FreezeTopRow -PassThru
 
+    # 2. Add extra sheets if data exists
     if ($Orphans) {
         $Orphans | Export-Excel -ExcelPackage $ExcelPackage -WorksheetName "Orphan_Certs" -AutoSize -BoldTopRow
     }
@@ -221,11 +215,28 @@ try {
         $OfflineServers | Export-Excel -ExcelPackage $ExcelPackage -WorksheetName "Errors_Offline" -AutoSize -BoldTopRow
     }
 
+    # 3. Apply Conditional Formatting safely
+    # We look up the sheet by name through the Workbook object
+    $targetSheet = $ExcelPackage.Workbook.Worksheets | Where-Object { $_.Name -eq "Inventory" }
+
+    if ($null -ne $targetSheet) {
+        # Column F is 'DaysLeft'. 
+        # Red if < 30 days
+        Add-ConditionalFormatting -Worksheet $targetSheet -Address "F:F" -RuleType LessThan -ConditionValue 30 -ForegroundColor White -BackgroundColor Red
+        # Yellow if < WarningDays
+        Add-ConditionalFormatting -Worksheet $targetSheet -Address "F:F" -RuleType LessThan -ConditionValue $WarningDays -ForegroundColor Black -BackgroundColor Yellow
+    }
+
+    # 4. Final Save
     Close-ExcelPackage -ExcelPackage $ExcelPackage
     Write-Host "[+] Report saved to: $ExcelPath" -ForegroundColor Green
 }
 catch {
+    # If the file is open in Excel, this catch block will trigger
     Write-Error "Excel Export Failed: $($_.Exception.Message)"
+    if ($_.Exception.Message -match "process cannot access the file") {
+        Write-Warning "Check if the Excel file is already open!"
+    }
 }
 
 # ------------------------------------------------------------
