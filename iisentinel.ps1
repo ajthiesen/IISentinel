@@ -125,33 +125,53 @@ $TopRiskServers = $Inventory | Where-Object { $_.Grade -eq "F" } | Group-Object 
 # ------------------------------------------------------------
 # 5) Branded Excel Export
 # ------------------------------------------------------------
+# 5) Branded Excel Export (Passthru Edition)
 try {
-    if (Test-Path $ExcelPath) { Remove-Item $ExcelPath -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $ExcelPath) { Remove-Object $ExcelPath -Force -ErrorAction SilentlyContinue }
     Write-Host "[*] Building Executive Dashboard..." -ForegroundColor Cyan
 
-    # A) Dashboard Sheet
+    # Start the Excel Package
+    $ExcelPackage = $Inventory | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow -PassThru
+
+    # A) Add the Dashboard Sheet
     $DashboardInfo = @(
-        [pscustomobject]@{ "Metric" = "Fleet Health Score"; "Value" = $HealthScore }
-        [pscustomobject]@{ "Metric" = "Total HTTPS Sites Audited"; "Value" = $TotalSites }
-        [pscustomobject]@{ "Metric" = "Critical Failures (Grade F)"; "Value" = ($Inventory | Where-Object {$_.Grade -eq "F"}).Count }
+        [pscustomobject]@{ "Security Metric" = "Fleet Health Score"; "Status" = $HealthScore }
+        [pscustomobject]@{ "Security Metric" = "Total HTTPS Sites Audited"; "Status" = $TotalSites }
+        [pscustomobject]@{ "Security Metric" = "Critical Failures (Grade F)"; "Status" = ($Inventory | Where-Object {$_.Grade -eq "F"}).Count }
     )
-    $DashboardInfo | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -Title "FLEET SECURITY POSTURE" -TitleBold -TitleSize 16
-    $SummaryStats  | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -StartRow 7 -TableName "GradeSummary"
-    $TopRiskServers | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -StartRow 7 -StartColumn 6 -TableName "TopRisks"
-
-    # B) Data Sheets
-    $Inventory | Sort-Object Grade -Descending | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow
-    if ($OfflineServers) { $OfflineServers | Export-Excel -Path $ExcelPath -WorksheetName "Connectivity_Errors" -TableStyle Medium1 -AutoSize }
-
-    # C) Formatting
-    $pkg = Open-ExcelPackage -Path $ExcelPath
-    $invSheet = $pkg.Workbook.Worksheets["Inventory"]
-    if ($null -ne $invSheet) {
-        # Column F is Grade
-        Add-ConditionalFormatting -Worksheet $invSheet -Address "F:F" -RuleType Equal -ConditionValue "A" -ForegroundColor White -BackgroundColor Green
-        Add-ConditionalFormatting -Worksheet $invSheet -Address "F:F" -RuleType Equal -ConditionValue "F" -ForegroundColor White -BackgroundColor Red
+    # We use the -ExcelPackage parameter to stay in the same file
+    $DashboardInfo | Export-Excel -ExcelPackage $ExcelPackage -WorksheetName "Dashboard" -Title "FLEET SECURITY POSTURE" -TitleBold -TitleSize 16
+    
+    # Add the Grade Summary Table to the Dashboard
+    $SummaryStats | Export-Excel -ExcelPackage $ExcelPackage -WorksheetName "Dashboard" -StartRow 7 -TableName "GradeSummary"
+    
+    # Add Top Risk Servers to the Dashboard
+    if ($TopRiskServers) {
+        $TopRiskServers | Export-Excel -ExcelPackage $ExcelPackage -WorksheetName "Dashboard" -StartRow 7 -StartColumn 6 -TableName "TopRisks"
     }
-    Close-ExcelPackage -ExcelPackage $pkg
+
+    # B) Add Connectivity Errors if any
+    if ($OfflineServers) {
+        $OfflineServers | Export-Excel -ExcelPackage $ExcelPackage -WorksheetName "Connectivity_Errors" -TableStyle Medium1 -AutoSize
+    }
+
+    # C) Final Formatting & Set Dashboard as Active
+    $dashSheet = $ExcelPackage.Workbook.Worksheets["Dashboard"]
+    $invSheet  = $ExcelPackage.Workbook.Worksheets["Inventory"]
+    
+    # Move Dashboard to the front (Index 1)
+    $ExcelPackage.Workbook.Worksheets.MoveToStart("Dashboard")
+    $dashSheet.View.TabSelected = $true
+    $invSheet.View.TabSelected = $false
+
+    # Apply Conditional Formatting to Inventory Grade Column (Column F)
+    Add-ConditionalFormatting -Worksheet $invSheet -Address "F:F" -RuleType Equal -ConditionValue "A" -ForegroundColor White -BackgroundColor Green
+    Add-ConditionalFormatting -Worksheet $invSheet -Address "F:F" -RuleType Equal -ConditionValue "F" -ForegroundColor White -BackgroundColor Red
+
+    # Save and Close
+    Close-ExcelPackage -ExcelPackage $ExcelPackage
     Write-Host "[+] Executive Audit saved: $ExcelPath" -ForegroundColor Green
 }
-catch { Write-Error "Export Failed: $($_.Exception.Message)" }
+catch { 
+    Write-Error "Export Failed: $($_.Exception.Message)" 
+}
