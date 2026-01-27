@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-    IISentinel Pro - Executive Edition v2.7
-    Features: Simple 2-Sheet Design (Dashboard + Inventory)
+    IISentinel Pro - Executive Edition v2.8
+    Features: Domain Analysis, Cleanup of System Columns, Remediation Guidance.
 #>
 
 [CmdletBinding()]
@@ -56,7 +56,7 @@ $RemoteScript = {
     foreach ($site in (Get-ChildItem IIS:\Sites)) {
         foreach ($bind in $site.Bindings.Collection) {
             if ($bind.protocol -ne "https") { continue }
-            $grade = "A"; $guidance = "Healthy"; $risk = @(); $certData = $null
+            $grade = "A"; $guidance = "No action required."; $risk = @(); $certData = $null
             
             $hash = Norm-Thumb (($bind.certificateHash | ForEach-Object { $_.ToString("X2") }) -join "")
             if ([string]::IsNullOrEmpty($hash)) {
@@ -67,20 +67,33 @@ $RemoteScript = {
             if ($hash -and $certMap.ContainsKey($hash)) {
                 $c = $certMap[$hash]
                 $days = [math]::Round(($c.NotAfter-(Get-Date)).TotalDays)
-                if ($days -lt 0) { $grade = "F"; $guidance = "EXPIRED" }
-                elseif ($days -lt 30) { $grade = "B"; $guidance = "Renew Soon" }
+                
+                # Remediation & Grading Logic
+                if ($days -lt 0) { 
+                    $grade = "F"; $guidance = "EXPIRED: Replace certificate immediately." 
+                }
+                elseif ($days -lt 30) { 
+                    $grade = "B"; $guidance = "EXPIRING SOON: Renew within 30 days." 
+                }
                 
                 $chain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
-                if (-not $chain.Build($c)) { $grade = "C"; $risk += "UntrustedChain" }
+                if (-not $chain.Build($c)) { 
+                    $grade = "C"; $risk += "UntrustedChain"; $guidance = "TRUST ISSUE: Verify intermediate/root installation."
+                }
 
                 $certData = [pscustomobject]@{ Sub=$c.Subject; Days=$days }
-            } else { $grade = "F"; $guidance = "Missing Cert" }
+            } else { 
+                $grade = "F"; $guidance = "CRITICAL: Binding exists but certificate is missing from store." 
+            }
             
+            # Note: We do NOT return PSComputerName here to keep the object clean
             $results += [pscustomobject]@{ 
-                ServerName=$env:COMPUTERNAME; SiteName=$site.Name; 
-                CertSubject=if($certData){$certData.Sub}else{"N/A"}; 
-                DaysLeft=if($certData){$certData.Days}else{$null}; 
-                Grade=$grade; Guidance=$guidance 
+                ServerName  = $env:COMPUTERNAME; 
+                SiteName    = $site.Name; 
+                CertSubject = if($certData){$certData.Sub}else{"N/A"}; 
+                DaysLeft    = if($certData){$certData.Days}else{$null}; 
+                Grade       = $grade; 
+                Remediation = $guidance 
             }
         }
     }
@@ -88,11 +101,19 @@ $RemoteScript = {
 }
 
 Write-Host "[*] Auditing $($OnlineServers.Count) servers..." -ForegroundColor Cyan
-$Inventory = Invoke-Command -ComputerName $OnlineServers -Credential $Credential -ScriptBlock $RemoteScript -ArgumentList $WarningDays -ThrottleLimit 20 -ErrorAction SilentlyContinue
+# Using -HideComputerName or simply selecting specific properties after the fact removes the metadata
+$RawInventory = Invoke-Command -ComputerName $OnlineServers -Credential $Credential -ScriptBlock $RemoteScript -ArgumentList $WarningDays -ThrottleLimit 20 -ErrorAction SilentlyContinue 
+$Inventory = $RawInventory | Select-Object ServerName, SiteName, CertSubject, DaysLeft, Grade, Remediation
 
-# 4) Dashboard Prep
+# 4) Analytics & Dashboard Prep
 $TotalSites = $Inventory.Count
 $HealthScore = "{0:P0}" -f (($Inventory | Where-Object { $_.Grade -match "A|B" }).Count / $TotalSites)
+
+# Domain Analysis Logic
+$DomainSummary = $Inventory | Where-Object { $_.CertSubject -ne "N/A" } | Group-Object CertSubject | 
+                 Select-Object @{N="Certificate Domain/Subject";E={$_.Name}}, @{N="Usage Count";E={$_.Count}} | 
+                 Sort-Object "Usage Count" -Descending | Select-Object -First 10
+
 $DashboardData = @(
     [pscustomobject]@{ "Metric" = "Fleet Health Score"; "Value" = $HealthScore }
     [pscustomobject]@{ "Metric" = "Total Sites Audited"; "Value" = $TotalSites }
@@ -100,30 +121,33 @@ $DashboardData = @(
 )
 
 # ------------------------------------------------------------
-# 5) The Simplified 2-Sheet Export
+# 5) The Clean 2-Sheet Export
 # ------------------------------------------------------------
 try {
-    Write-Host "[*] Saving Simple 2-Sheet Report..." -ForegroundColor Cyan
+    Write-Host "[*] Saving Domain-Aware Report..." -ForegroundColor Cyan
     
-    # Export Sheet 1: Inventory
-    $Inventory | Sort Grade -Descending | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow
+    # 1. Export Inventory (Sheet 1)
+    $Inventory | Sort-Object Grade -Descending | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow
     
-    # Export Sheet 2: Dashboard (Adding to the existing file)
+    # 2. Export Dashboard & Domain Analysis (Sheet 2)
     $DashboardData | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -Title "POSTURE SUMMARY" -TitleBold -TitleSize 16 -AutoSize
-    
-    # Final cleanup: Move Dashboard to front and set colors
+    $DomainSummary | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -StartRow 7 -TableName "TopDomainsUsed" -AutoSize
+
+    # 3. Final Tab Management
     $Pkg = Open-ExcelPackage -Path $ExcelPath
     $Pkg.Workbook.Worksheets.MoveToStart("Dashboard")
     $Pkg.Workbook.Worksheets["Dashboard"].View.TabSelected = $true
     
     $invSheet = $Pkg.Workbook.Worksheets["Inventory"]
-    # Column E is Grade in this simplified version
-    Add-ConditionalFormatting -Worksheet $invSheet -Address "E:E" -RuleType Equal -ConditionValue "A" -ForegroundColor White -BackgroundColor Green
-    Add-ConditionalFormatting -Worksheet $invSheet -Address "E:E" -RuleType Equal -ConditionValue "F" -ForegroundColor White -BackgroundColor Red
+    if ($invSheet) {
+        # Column E is Grade
+        Add-ConditionalFormatting -Worksheet $invSheet -Address "E:E" -RuleType Equal -ConditionValue "A" -ForegroundColor White -BackgroundColor Green
+        Add-ConditionalFormatting -Worksheet $invSheet -Address "E:E" -RuleType Equal -ConditionValue "F" -ForegroundColor White -BackgroundColor Red
+    }
     
     Close-ExcelPackage -ExcelPackage $Pkg
     
-    Write-Host "[+] Success! Report saved to $ExcelPath" -ForegroundColor Green
+    Write-Host "[+] Success! Report saved: $ExcelPath" -ForegroundColor Green
 }
 catch {
     Write-Error "Excel processing failed: $($_.Exception.Message)"
