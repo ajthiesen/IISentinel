@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    IISentinel Pro - Enterprise Audit Edition v2.3 (SAN Expansion)
+    IISentinel Pro - Enterprise Audit Edition v2.3.1 (SAN Expansion - Fix)
 #>
 
 [CmdletBinding()]
@@ -48,7 +48,7 @@ foreach ($Server in $Targets) {
     else { $OfflineServers.Add([pscustomobject]@{ ServerName = $Server; Status = "Offline"; Error = "Ping Failed" }) }
 }
 
-# 3) Remote Audit Logic (With SAN Expansion)
+# 3) Remote Audit Logic (Fixed Version)
 $RemoteScript = {
     param($WarningDays)
     $ErrorActionPreference = "SilentlyContinue"
@@ -74,7 +74,6 @@ $RemoteScript = {
                     $sanList = ""
                     $sanExtension = $c.Extensions | Where-Object { $_.Oid.FriendlyName -match "Subject Alternative Name" }
                     if ($sanExtension) {
-                        # Clean up the format: "DNS Name=site.com, DNS Name=api.site.com" -> "site.com, api.site.com"
                         $sanList = ($sanExtension.Format($false) -split "," | ForEach-Object { $_.Trim().Replace("DNS Name=", "") }) -join ", "
                     }
                     
@@ -83,7 +82,10 @@ $RemoteScript = {
                     
                     # Audit Logic
                     if ($days -lt 0) { $grade = "F"; $guidance = "EXPIRED: Replace certificate immediately." }
-                    elseif ($days -lt 30) { $grade = "B"; $guidance = "EXPIRING SOON: Renew within 30 days." }
+                    elseif ($days -lt 30) { 
+                        if ($grade -ne "F") { $grade = "B" }
+                        $guidance = "EXPIRING SOON: Renew within 30 days." 
+                    }
                     
                     if ($c.SignatureAlgorithm.FriendlyName -match "sha1") { 
                         $grade = "C"; $risk += "SHA1"; $guidance = "WEAK CRYPTO: Re-issue using SHA256." 
@@ -91,7 +93,13 @@ $RemoteScript = {
                     if ($ks -gt 0 -and $ks -lt 2048) { 
                         $grade = "C"; $risk += "WeakKey($ks)"; $guidance = "WEAK KEY: Re-issue with 2048-bit minimum." 
                     }
-                    if (-not $sanList) { $risk += "Missing-SAN"; $grade = ($grade -match "F") ? "F" : "C"; $guidance = "MODERN COMPLIANCE: Cert missing SAN field. Re-issue." }
+                    
+                    # Missing SAN Check (The Fixed Line)
+                    if (-not $sanList) { 
+                        $risk += "Missing-SAN"
+                        if ($grade -ne "F") { $grade = "C" }
+                        $guidance = "MODERN COMPLIANCE: Cert missing SAN field. Re-issue." 
+                    }
                     
                     $certData = [pscustomobject]@{ Subject=$c.Subject; SAN=$sanList; DaysLeft=$days; KeySize=$ks }
                 } else {
@@ -123,8 +131,8 @@ $Inventory = ($RawResults | Where-Object { $_.Type -eq "Inv" }).Data
 # 4) Data Preparation
 $ServerSummary = $Inventory | Group-Object ServerName | Select-Object @{Name="Server Name";Expression={$_.Name}}, @{Name="Cert Count";Expression={$_.Count}}, @{Name="Lowest Grade";Expression={ ($_.Group.Grade | Sort-Object | Select-Object -First 1) }} | Sort-Object "Lowest Grade"
 $VersionHistory = @(
-    [pscustomobject]@{ Version="2.3"; Date="2026-01-27"; Change="Added SAN (Subject Alternative Name) Expansion" }
-    [pscustomobject]@{ Version="2.2"; Date="2026-01-27"; Change="Added Security Grades & Remediation Guidance" }
+    [pscustomobject]@{ Version="2.3.1"; Date="2026-01-27"; Change="Fixed PowerShell Ternary Syntax Bug" }
+    [pscustomobject]@{ Version="2.3"; Date="2026-01-27"; Change="Added SAN Expansion" }
 )
 
 # 5) Branded Excel Export
@@ -132,34 +140,28 @@ try {
     if (Test-Path $ExcelPath) { Remove-Item $ExcelPath -Force -ErrorAction SilentlyContinue }
     Write-Host "[*] Building SAN-Enabled Report..." -ForegroundColor Cyan
 
-    # A) Disclaimer
     $Disclaimer = @(
         [pscustomobject]@{ "IISentinel Security Audit" = "Prepared For: NCH HCS Server Team" }
         [pscustomobject]@{ "IISentinel Security Audit" = "Grade Key: A=Healthy, B=Warning, C=Weak Crypto, F=Critical/Expired" }
-        [pscustomobject]@{ "IISentinel Security Audit" = "SAN Field: Expanded to reveal multi-domain certificate coverage." }
     )
     $Disclaimer | Export-Excel -Path $ExcelPath -WorksheetName "Disclaimer" -Title "AUDIT OVERVIEW" -TitleBold -TitleSize 14
 
-    # B) Server Summary
     $ServerSummary | Export-Excel -Path $ExcelPath -WorksheetName "Server_Summary" -TableStyle Medium4 -AutoSize
 
-    # C) Full Inventory
     if ($Inventory) {
         $Inventory | Sort-Object Grade -Descending | Select-Object ServerName, SiteName, Port, CertSubject, SAN, DaysLeft, Grade, Risk, Guidance | 
             Export-Excel -Path $ExcelPath -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow -FreezeTopRow
     }
 
-    # D) Failures & History
     if ($OfflineServers.Count -gt 0) { $OfflineServers | Export-Excel -Path $ExcelPath -WorksheetName "Connectivity_Errors" -TableStyle Medium1 -AutoSize }
     $VersionHistory | Export-Excel -Path $ExcelPath -WorksheetName "Version_History" -TableStyle Medium9 -AutoSize
 
-    # E) Final Formatting Pass
     $pkg = Open-ExcelPackage -Path $ExcelPath
     $invSheet = $pkg.Workbook.Worksheets["Inventory"]
     if ($null -ne $invSheet) {
-        # Column F is DaysLeft, Column G is Grade
         Add-ConditionalFormatting -Worksheet $invSheet -Address "G:G" -RuleType Equal -ConditionValue "A" -ForegroundColor White -BackgroundColor Green
-        Add-ConditionalFormatting -Worksheet $invSheet -Address "G:G" -RuleType Equal -ConditionValue "C" -ForegroundColor Black -BackgroundColor Yellow
+        Add-ConditionalFormatting -Worksheet $invSheet -Address "G:G" -RuleType Equal -ConditionValue "B" -ForegroundColor Black -BackgroundColor Yellow
+        Add-ConditionalFormatting -Worksheet $invSheet -Address "G:G" -RuleType Equal -ConditionValue "C" -ForegroundColor Black -BackgroundColor Orange
         Add-ConditionalFormatting -Worksheet $invSheet -Address "G:G" -RuleType Equal -ConditionValue "F" -ForegroundColor White -BackgroundColor Red
     }
     Close-ExcelPackage -ExcelPackage $pkg
@@ -169,7 +171,6 @@ catch { Write-Error "Export Failed: $($_.Exception.Message)" }
 
 # 6) Email
 if ($SendEmail -and $To) {
-    $Critical = ($Inventory | Where-Object { $_.Grade -eq "F" }).Count
-    Send-MailMessage -To $To -From $From -Subject "$EmailSubject - $TimeStamp" -Body "SSL Audit with SAN details attached. Critical issues found: $Critical" -SmtpServer $SmtpServer -Attachments $ExcelPath
+    Send-MailMessage -To $To -From $From -Subject "$EmailSubject - $TimeStamp" -Body "SSL Audit attached." -SmtpServer $SmtpServer -Attachments $ExcelPath
 }
 Write-Host "[!] Audit Finished Successfully." -ForegroundColor Cyan
