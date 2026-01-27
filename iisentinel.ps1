@@ -115,50 +115,51 @@ $SuccessCount = ($Inventory.ServerName | Select -Unique | Measure-Object).Count
 Write-Host "[+] Scan complete. Success: $SuccessCount, Failed: $($OfflineServers.Count)" -ForegroundColor Green
 
 # ------------------------------------------------------------
-# 4) Professional Excel Export (Stability Fix)
+# 4) Professional Excel Export (Final Stability Fix)
 # ------------------------------------------------------------
 try {
+    # Ensure a fresh start
     if (Test-Path $ExcelPath) { Remove-Item $ExcelPath -Force }
 
-    # Open a new Excel package explicitly
-    $ExcelPackage = Open-ExcelPackage -Path $ExcelPath
+    Write-Host "[*] Creating Excel Report..." -ForegroundColor Cyan
 
-    # 1. Export Main Inventory
-    if ($Inventory) {
-        $Inventory | Export-Excel -ExcelPackage $ExcelPackage -WorksheetName "Inventory" `
-            -TableStyle Medium2 -AutoSize -BoldTopRow -FreezeTopRow
-    }
+    # 1. Create the file and the first sheet simultaneously
+    # This ensures $pkg is never null.
+    $pkg = $Inventory | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" `
+        -TableStyle Medium2 -AutoSize -BoldTopRow -FreezeTopRow -PassThru
 
-    # 2. Export Orphans
+    Start-Sleep -Milliseconds 500
+
+    # 2. Add Orphans if they exist
     if ($Orphans) {
-        $Orphans | Export-Excel -ExcelPackage $ExcelPackage -WorksheetName "Orphaned_Certs" `
+        $Orphans | Export-Excel -ExcelPackage $pkg -WorksheetName "Orphaned_Certs" `
             -TableStyle Medium9 -AutoSize
+        Start-Sleep -Milliseconds 200
     }
 
-    # 3. Export Connection Errors
+    # 3. Add Connection Errors if they exist
     if ($OfflineServers.Count -gt 0) {
-        $OfflineServers | Export-Excel -ExcelPackage $ExcelPackage -WorksheetName "Connection_Errors" `
+        $OfflineServers | Export-Excel -ExcelPackage $pkg -WorksheetName "Connection_Errors" `
             -TableStyle Medium1 -AutoSize
+        Start-Sleep -Milliseconds 200
     }
 
-    # 4. Apply Conditional Formatting Safely
-    # Look for the sheet in the package object directly
-    $invSheet = $ExcelPackage.Workbook.Worksheets | Where-Object { $_.Name -eq "Inventory" }
-    
+    # 4. Apply Conditional Formatting
+    $invSheet = $pkg.Workbook.Worksheets | Where-Object { $_.Name -eq "Inventory" }
     if ($null -ne $invSheet) {
         # Column F is 'DaysLeft'
         Add-ConditionalFormatting -Worksheet $invSheet -Address "F:F" -RuleType LessThan -ConditionValue 30 -ForegroundColor White -BackgroundColor Red
         Add-ConditionalFormatting -Worksheet $invSheet -Address "F:F" -RuleType LessThan -ConditionValue $WarningDays -ForegroundColor Black -BackgroundColor Yellow
     }
 
-    # 5. Save and Close the Package
-    Close-ExcelPackage -ExcelPackage $ExcelPackage
+    # 5. Save and Close
+    Close-ExcelPackage -ExcelPackage $pkg
     Write-Host "[+] Professional report saved: $ExcelPath" -ForegroundColor Green
 }
 catch {
-    # If anything fails, try to close the package to release file locks
-    if ($ExcelPackage) { Close-ExcelPackage -ExcelPackage $ExcelPackage -NoSave }
     Write-Error "Excel Export Failed: $($_.Exception.Message)"
+    # Clean up if possible
+    if ($null -ne $pkg) { Close-ExcelPackage -ExcelPackage $pkg -NoSave }
 }
 
 # ------------------------------------------------------------
