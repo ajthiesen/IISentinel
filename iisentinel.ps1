@@ -1,8 +1,8 @@
 <#
 .SYNOPSIS
-    IISentinel Pro v4.6 - The Corrected Master Build
+    IISentinel Pro v4.7 - The Fallback Edition
     LOCKED CORE: v4.1 Remote Audit Engine + v4.5.5 Reporting Structure.
-    FIX: Added WebHosting store search to resolve "N/A" certificate data.
+    FIX: Added Fuzzy Fallback and CCS Detection to resolve "N/A" data.
 #>
 
 [CmdletBinding()]
@@ -46,7 +46,7 @@ foreach ($Server in $UniqueTargets) {
     }
 }
 
-# 3) Remote Audit Logic (ENHANCED SEARCH, LOCKED STRUCTURE)
+# 3) Remote Audit Logic (ENHANCED WITH FUZZY FALLBACK)
 $RemoteScript = {
     param($WarningDays)
     if (-not (Get-Module -Name WebAdministration)) { Import-Module WebAdministration -ErrorAction SilentlyContinue }
@@ -56,7 +56,7 @@ $RemoteScript = {
     $tls11 = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1\Server" -Name Enabled -ErrorAction SilentlyContinue
     $weakTLS = ($tls10.Enabled -eq 1 -or $tls11.Enabled -eq 1)
     
-    # FIX: Load BOTH 'My' (Personal) and 'WebHosting' stores
+    # Load ALL stores to be safe
     $allCerts = Get-ChildItem Cert:\LocalMachine\My, Cert:\LocalMachine\WebHosting -ErrorAction SilentlyContinue
     
     $results = @()
@@ -66,6 +66,7 @@ $RemoteScript = {
         
         foreach ($bind in $site.Bindings.Collection) {
             $port = ($bind.bindingInformation -split ":")[1]
+            $hostName = ($bind.bindingInformation -split ":")[2]
             $grade = "A"; $risk = @(); $daysStr = "N/A"; $sub = "N/A"; $san = "N/A"; $tp = "N/A"
             
             if ($bind.protocol -eq "https") {
@@ -73,24 +74,38 @@ $RemoteScript = {
                 if ($port -ne "443") { $grade = "B"; $risk += "NonStandardPort" }
                 if ($weakTLS) { $grade = "C"; $risk += "WeakTLS" }
                 
-                # Robust Hash Matching
-                $rawHash = $bind.certificateHash
+                # Method 1: Try Hash (Safe Accessor)
+                $rawHash = $bind.GetAttributeValue("certificateHash")
+                $flags   = $bind.GetAttributeValue("sslFlags") # Check for CCS
+                $foundCert = $null
+
                 if ($rawHash) {
                     $lookupHash = [System.BitConverter]::ToString($rawHash).Replace("-","")
-                    # Match against loaded certs from both stores
-                    $c = $allCerts | Where-Object { $_.Thumbprint -eq $lookupHash } | Select-Object -First 1
-                    
-                    if ($c) {
-                        $diff = [math]::Round(($c.NotAfter-(Get-Date)).TotalDays)
-                        $daysStr = [string]$diff # Forced String
-                        $sub = $c.Subject
-                        $tp = $c.Thumbprint
-                        $san = ($c.Extensions | Where-Object { $_.Oid.FriendlyName -match "Subject Alternative Name" }).Format($false)
-                        if ($diff -lt 0) { $grade = "F" } elseif ($diff -lt 30) { $grade = "B" }
-                    } else { 
-                        $grade = "F"; $risk += "CertStoreMismatch" 
-                    }
-                } else { $grade = "F"; $risk += "NoBindingHash" }
+                    $foundCert = $allCerts | Where-Object { $_.Thumbprint -eq $lookupHash } | Select-Object -First 1
+                }
+                
+                # Method 2: Fuzzy Fallback (Match by Hostname)
+                if (-not $foundCert -and $hostName) {
+                    $foundCert = $allCerts | Where-Object { $_.Subject -match $hostName -or $_.DnsNameList -contains $hostName } | Select-Object -First 1
+                    if ($foundCert) { $risk += "FuzzyMatchUsed" }
+                }
+
+                if ($foundCert) {
+                    $diff = [math]::Round(($foundCert.NotAfter-(Get-Date)).TotalDays)
+                    $daysStr = [string]$diff # Forced String
+                    $sub = $foundCert.Subject
+                    $tp = $foundCert.Thumbprint
+                    $san = ($foundCert.Extensions | Where-Object { $_.Oid.FriendlyName -match "Subject Alternative Name" }).Format($false)
+                    if ($diff -lt 0) { $grade = "F" } elseif ($diff -lt 30) { $grade = "B" }
+                } elseif ($flags -eq 2 -or $flags -eq 3) {
+                     # Centralized Certificate Store detected
+                     $grade = "A" # Assume managed if CCS, or set to Check
+                     $risk += "CCS:Managed"
+                     $daysStr = "CCS"
+                     $sub = "Centralized Store"
+                } else { 
+                    $grade = "F"; $risk += "CertNotFound" 
+                }
 
             } elseif ($bind.protocol -eq "http") { $hasHttp = $true }
 
@@ -109,13 +124,10 @@ $RemoteScript = {
 Write-Host "[*] Auditing $($OnlineServers.Count) servers via WinRM..." -ForegroundColor Cyan
 $InventoryRaw = Invoke-Command -ComputerName $OnlineServers -Credential $Credential -ScriptBlock $RemoteScript -ArgumentList $WarningDays -ThrottleLimit 20 -ErrorAction SilentlyContinue 
 
-# 4) Post-Processing (v4.5.5 Logic Restored)
+# 4) Post-Processing (Restored v4.5.5 Logic)
 $Inventory = $InventoryRaw | Where-Object { $_.ServerName } | Select-Object ServerName, SiteName, Protocol, Port, CertSubject, Thumbprint, SAN, DaysLeft, Grade, Risk
-
-# Dashboard Sort A-F
 $GradeCounts = $Inventory | Group-Object Grade | Select-Object @{N="Grade";E={$_.Name}}, Count | Sort-Object Grade
 
-# Remediation & Connectivity
 $AuditedServers = $Inventory.ServerName | Sort-Object -Unique
 $WinRMFailures = $OnlineServers | Where-Object { $_ -notin $AuditedServers } | ForEach-Object { [pscustomobject]@{ ServerName=$_; Status="WinRM Denied/No IIS"; Latency="Online" } }
 $FullFailLog = $OfflineServers + $WinRMFailures
@@ -125,20 +137,17 @@ foreach ($issue in ($Inventory | Where-Object { $_.Grade -ne "A" })) {
     $fix = switch -regex ($issue.Risk) {
         "MissingRedirect" { "Set-WebConfigurationProperty -pspath 'IIS:\Sites\$($issue.SiteName)' -filter 'system.webServer/httpRedirect' -name 'enabled' -value 'True'" }
         "WeakTLS" { "New-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0\Server' -Name 'Enabled' -Value 0 -PropertyType DWord -Force" }
-        "CertStoreMismatch" { "Certificate thumbprint exists in IIS binding but not in LocalMachine\My or WebHosting store. Re-import certificate." }
+        "CertNotFound" { "Certificate missing from Local Store. Re-import certificate or check CCS path." }
         default { if($issue.Grade -eq "F") { "Bind valid SSL certificate to port $($issue.Port)" } }
     }
     if ($fix) { $RemediationList += [pscustomobject]@{ Server=$issue.ServerName; Site=$issue.SiteName; Issue=$issue.Risk; PowerShell_Fix=$fix } }
 }
 
-# 5) Stable Export (v4.5.5 Logic Restored)
+# 5) Stable Export (Locked v4.5.5 Logic)
 try {
-    Write-Host "[*] Saving Final Corrected Report..." -ForegroundColor Cyan
-    
-    # Inventory
+    Write-Host "[*] Saving Fallback Audit Report..." -ForegroundColor Cyan
     $Inventory | Sort-Object Grade -Descending | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow
     
-    # Dashboard
     $DashData = @(
         [pscustomobject]@{ Client = $ClientName; Date = $RunDate.ToShortDateString() }
         [pscustomobject]@{ Metric = "Fleet Health Score"; Value = ("{0:P0}" -f (($Inventory | Where-Object {$_.Grade -match "A|B"}).Count / $Inventory.Count)) }
@@ -146,47 +155,35 @@ try {
         [pscustomobject]@{ Metric = "Critical Issues Found"; Value = $RemediationList.Count }
     )
     $DashData | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -Title "$ClientName Security Summary" -AutoSize
-    
-    # Chart Data & Supporting Tabs
     $GradeCounts | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -StartRow 10 -TableName "ChartData"
     if ($RemediationList) { $RemediationList | Export-Excel -Path $ExcelPath -WorksheetName "Remediation_Plan" -TableStyle Medium9 -AutoSize }
     if ($FullFailLog) { $FullFailLog | Export-Excel -Path $ExcelPath -WorksheetName "Connectivity_Issues" -TableStyle Medium1 -AutoSize }
 
-    # Styling & Charting
     $Pkg = Open-ExcelPackage -Path $ExcelPath
-    $dashSheet = $Pkg.Workbook.Worksheets["Dashboard"]
-    $invSheet = $Pkg.Workbook.Worksheets["Inventory"]
-
-    # Pie Chart
+    $dashSheet = $Pkg.Workbook.Worksheets["Dashboard"]; $invSheet = $Pkg.Workbook.Worksheets["Inventory"]
+    
     $chart = $dashSheet.Drawings.AddChart("HealthChart", [OfficeOpenXml.Drawing.Chart.eChartType]::Pie)
     $chart.SetPosition(2, 0, 5, 0); $chart.SetSize(400, 300); $chart.Title.Text = "Security Grade Distribution"
     $series = $chart.Series.Add($dashSheet.Cells["B11:B$(10 + $GradeCounts.Count)"], $dashSheet.Cells["A11:A$(10 + $GradeCounts.Count)"])
     $chart.DataLabel.ShowPercent = $true
 
-    # Inventory Colors
     if ($invSheet.Dimension) {
         for ($i = 2; $i -le $invSheet.Dimension.Rows; $i++) {
-            $dayCell = $invSheet.Cells[$i, 8]   # DaysLeft
-            $gradeCell = $invSheet.Cells[$i, 9] # Grade
-            
+            $dayCell = $invSheet.Cells[$i, 8]; $gradeCell = $invSheet.Cells[$i, 9]
             $gradeCell.Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
             if ($gradeCell.Value -eq "A") { $gradeCell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::Green); $gradeCell.Style.Font.Color.SetColor([System.Drawing.Color]::White) }
             elseif ($gradeCell.Value -eq "C") { $gradeCell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::Orange) }
             elseif ($gradeCell.Value -eq "F") { $gradeCell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::Red); $gradeCell.Style.Font.Color.SetColor([System.Drawing.Color]::White) }
             
-            # Yellow Expiry
-            if ($dayCell.Value -ne "N/A" -and $dayCell.Value -match '^-?\d+$' -and [int]$dayCell.Value -lt 30) {
+            if ($dayCell.Value -ne "N/A" -and $dayCell.Value -ne "CCS" -and $dayCell.Value -match '^-?\d+$' -and [int]$dayCell.Value -lt 30) {
                 $dayCell.Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
                 $dayCell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::Yellow)
             }
         }
     }
-
-    $dashSheet.View.ShowGridLines = $false
-    $Pkg.Workbook.Worksheets.MoveToStart("Dashboard")
+    $dashSheet.View.ShowGridLines = $false; $Pkg.Workbook.Worksheets.MoveToStart("Dashboard")
     Close-ExcelPackage -ExcelPackage $Pkg
-    
-    Write-Host "[+] Success! Report saved: $ExcelPath" -ForegroundColor Green
+    Write-Host "[+] Success! 'N/A' should now be populated or marked CCS." -ForegroundColor Green
     explorer.exe /select,$ExcelPath
 } catch {
     Write-Error "Export failed: $($_.Exception.Message)"
