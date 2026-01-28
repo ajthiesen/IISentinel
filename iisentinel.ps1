@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-    IISentinel Pro v3.8 - Final Stability Build
-    Fix: Fixed ConditionalFormat ValidateSet error; restored full security metrics.
+    IISentinel Pro v3.9 - Final Range Fix
+    Fix: Explicitly bound ConditionalText to the 'Grade' column header.
 #>
 
 [CmdletBinding()]
@@ -44,7 +44,6 @@ $RemoteScript = {
     if (-not (Get-Module -Name WebAdministration)) { Import-Module WebAdministration -ErrorAction SilentlyContinue }
     if (-not (Test-Path IIS:\Sites)) { return $null }
 
-    # TLS Check
     $tls10 = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0\Server" -Name Enabled -ErrorAction SilentlyContinue
     $tls11 = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1\Server" -Name Enabled -ErrorAction SilentlyContinue
     $weakTLS = ($tls10.Enabled -eq 1 -or $tls11.Enabled -eq 1)
@@ -113,10 +112,10 @@ $DashboardData = @(
 try {
     Write-Host "[*] Saving Security Audit Report..." -ForegroundColor Cyan
     
-    # Define Rules (Cleaned of IconSet conflicts)
-    $RuleA = New-ConditionalText -Text "A" -BackgroundColor Green -ForegroundColor White
-    $RuleC = New-ConditionalText -Text "C" -BackgroundColor Orange -ForegroundColor Black
-    $RuleF = New-ConditionalText -Text "F" -BackgroundColor Red -ForegroundColor White
+    # FIX: Explicitly specify the 'Range' (Column Name) for the formatting rules
+    $RuleA = New-ConditionalText -Range "Grade" -Text "A" -BackgroundColor Green -ForegroundColor White
+    $RuleC = New-ConditionalText -Range "Grade" -Text "C" -BackgroundColor Orange -ForegroundColor Black
+    $RuleF = New-ConditionalText -Range "Grade" -Text "F" -BackgroundColor Red -ForegroundColor White
 
     # 1. Export Inventory
     $Inventory | Sort-Object Grade -Descending | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" `
