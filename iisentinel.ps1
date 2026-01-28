@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-    IISentinel Pro v3.4 - Streamlined Export
-    Fix: Uses the most basic pipeline-to-file method to avoid Worksheet conflicts.
+    IISentinel Pro v3.5 - High-Stability Build
+    Fix: Uses a CSV buffer to ensure data is "cold" before Excel styling.
 #>
 
 [CmdletBinding()]
@@ -20,28 +20,24 @@ $ErrorActionPreference = "Stop"
 if (-not (Test-Path $OutputPath)) { New-Item $OutputPath -ItemType Directory -Force | Out-Null }
 $RunDate = Get-Date
 $TimeStamp = $RunDate.ToString("yyyyMMdd-HHmm")
-$ExcelPath = Join-Path $OutputPath "IISentinel_Security_Audit_$TimeStamp.xlsx"
+$ExcelPath = Join-Path $OutputPath "IISentinel_Audit_$TimeStamp.xlsx"
+$TempCsv   = Join-Path $OutputPath "IISentinel_Temp.csv"
 
-# 2) Discovery (Proven Solid)
+# 2) Discovery
 Write-Host "[*] Discovering targets..." -ForegroundColor Cyan
 $Targets = [System.Collections.Generic.List[string]]::new()
 if ($ServerNames) { $Targets.AddRange($ServerNames) }
 if ($OU) {
     try {
-        $adComputers = Get-ADComputer -SearchBase $OU -SearchScope Subtree -Filter { Enabled -eq $true } | Select-Object -ExpandProperty Name
-        if ($adComputers) { [string[]]$adArray = $adComputers; $Targets.AddRange($adArray) }
+        $Targets.AddRange((Get-ADComputer -SearchBase $OU -Filter {Enabled -eq $true}).Name)
     } catch { Write-Warning "AD Search failed." }
 }
-$UniqueTargets = $Targets | Sort-Object -Unique
-$OnlineServers = $UniqueTargets | Where-Object { Test-Connection -ComputerName $_ -Count 1 -Quiet }
+$OnlineServers = $Targets | Sort-Object -Unique | Where-Object { Test-Connection $_ -Count 1 -Quiet }
 
-if (-not $OnlineServers) { Write-Error "No servers responded to ping."; return }
-
-# 3) Remote Audit Logic (Proven Resilient)
+# 3) Remote Audit Logic
 $RemoteScript = {
     param($WarningDays)
-    $results = @()
-    if (-not (Get-Module -Name WebAdministration)) { Import-Module WebAdministration -ErrorAction SilentlyContinue }
+    Import-Module WebAdministration -ErrorAction SilentlyContinue
     if (-not (Test-Path IIS:\Sites)) { return $null }
 
     $tls10 = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0\Server" -Name Enabled -ErrorAction SilentlyContinue
@@ -49,17 +45,16 @@ $RemoteScript = {
     $weakTLS = ($tls10.Enabled -eq 1 -or $tls11.Enabled -eq 1)
 
     $certMap = @{}
-    Get-ChildItem Cert:\LocalMachine -Recurse | Where-Object { $_.Thumbprint } | ForEach-Object {
-        if (-not $certMap.ContainsKey($_.Thumbprint)) { $certMap[$_.Thumbprint] = $_ }
-    }
+    Get-ChildItem Cert:\LocalMachine -Recurse | Where-Object {$_.Thumbprint} | ForEach-Object { if(!$certMap.ContainsKey($_.Thumbprint)){$certMap[$_.Thumbprint]=$_} }
     
+    $results = @()
     foreach ($site in (Get-ChildItem IIS:\Sites)) {
         $hasHttps = $false; $hasHttp = $false
         $redirect = (Get-WebConfigurationProperty -pspath "IIS:\Sites\$($site.Name)" -filter "system.webServer/httpRedirect" -name "enabled").Value
 
         foreach ($bind in $site.Bindings.Collection) {
             $port = ($bind.bindingInformation -split ":")[1]
-            $grade = "A"; $guidance = "Healthy"; $risk = @(); $certData = $null
+            $grade = "A"; $risk = @(); $certData = $null
             
             if ($bind.protocol -eq "https") {
                 $hasHttps = $true
@@ -71,78 +66,68 @@ $RemoteScript = {
 
                 if ($hash -and $certMap.ContainsKey($hash)) {
                     $c = $certMap[$hash]; $days = [math]::Round(($c.NotAfter-(Get-Date)).TotalDays)
-                    $sanList = ""
-                    $sanExt = $c.Extensions | Where-Object { $_.Oid.FriendlyName -match "Subject Alternative Name" }
-                    if ($sanExt) { $sanList = ($sanExt.Format($false) -split "," | ForEach-Object { $_.Trim().Replace("DNS Name=", "") }) -join ", " }
-
-                    if ($days -lt 0) { $grade = "F"; $guidance = "EXPIRED" }
-                    elseif ($days -lt 30) { $grade = "B"; $guidance = "Renew Soon" }
-                    $certData = [pscustomobject]@{ Sub=$c.Subject; SAN=$sanList; Days=$days }
-                } else { $grade = "F"; $guidance = "Cert Missing" }
+                    if ($days -lt 0) { $grade = "F" } elseif ($days -lt 30) { $grade = "B" }
+                    $certData = [pscustomobject]@{ Sub=$c.Subject; Days=$days }
+                } else { $grade = "F" }
             }
             elseif ($bind.protocol -eq "http") { $hasHttp = $true }
 
             $results += [pscustomobject]@{ 
                 ServerName=$env:COMPUTERNAME; SiteName=$site.Name; Protocol=$bind.protocol; Port=$port;
-                CertSubject=if($certData){$certData.Sub}else{"N/A"}; SAN=if($certData){$certData.SAN}else{"N/A"};
-                DaysLeft=if($certData){$certData.Days}else{$null}; Grade=$grade; Remediation=$guidance; Risk=($risk -join ",")
+                CertSubject=if($certData){$certData.Sub}else{"N/A"}; DaysLeft=if($certData){$certData.Days}else{$null}; 
+                Grade=$grade; Risk=($risk -join ",")
             }
         }
-        if ($hasHttp -and $hasHttps -and -not $redirect) {
-            $results += [pscustomobject]@{ 
-                ServerName=$env:COMPUTERNAME; SiteName=$site.Name; Protocol="SECURITY_GAP"; Port="80";
-                CertSubject="N/A"; SAN="N/A"; DaysLeft=$null; Grade="C"; Remediation="Missing Redirect"; Risk="InsecureHTTP"
-            }
+        if ($hasHttp -and $hasHttps -and !$redirect) {
+            $results += [pscustomobject]@{ ServerName=$env:COMPUTERNAME; SiteName=$site.Name; Protocol="GAP"; Port="80"; CertSubject="N/A"; DaysLeft=$null; Grade="C"; Risk="InsecureHTTP" }
         }
     }
     return $results
 }
 
-Write-Host "[*] Auditing $($OnlineServers.Count) servers via WinRM..." -ForegroundColor Cyan
+Write-Host "[*] Auditing $($OnlineServers.Count) servers..." -ForegroundColor Cyan
 $Inventory = Invoke-Command -ComputerName $OnlineServers -Credential $Credential -ScriptBlock $RemoteScript -ArgumentList $WarningDays -ThrottleLimit 20 -ErrorAction SilentlyContinue | 
              Where-Object { $_.ServerName } | 
-             Select-Object ServerName, SiteName, Protocol, Port, CertSubject, SAN, DaysLeft, Grade, Remediation, Risk
+             Select-Object ServerName, SiteName, Protocol, Port, CertSubject, DaysLeft, Grade, Risk
 
-# 4) Analytics
-$TotalSites = if ($Inventory) { $Inventory.Count } else { 0 }
-if ($TotalSites -eq 0) { Write-Error "No IIS data returned."; return }
-
-$HealthScore = "{0:P0}" -f (($Inventory | Where-Object { $_.Grade -match "A|B" }).Count / $TotalSites)
-$DomainSummary = $Inventory | Where-Object { $_.CertSubject -ne "N/A" } | Group-Object CertSubject | 
-                 Select-Object @{N="Cert Domain";E={$_.Name}}, @{N="Usage";E={$_.Count}} | 
-                 Sort-Object Usage -Descending | Select-Object -First 10
-
-$DashboardData = @(
-    [pscustomobject]@{ Metric = "Fleet Health Score"; Value = $HealthScore }
-    [pscustomobject]@{ Metric = "Total Bindings Audited"; Value = $TotalSites }
-    [pscustomobject]@{ Metric = "Security Issues (C/F)"; Value = ($Inventory | Where-Object {$_.Grade -match "C|F"}).Count }
+# 4) Dashboard Prep
+$Total = $Inventory.Count
+$Health = "{0:P0}" -f (($Inventory | Where-Object {$_.Grade -match "A|B"}).Count / $Total)
+$Dash = @(
+    [pscustomobject]@{ Metric = "Fleet Health Score"; Value = $Health }
+    [pscustomobject]@{ Metric = "Total Bindings"; Value = $Total }
 )
 
 # -------------------------------------------------------------------------
-# 5) The "No-Frills" Export (Sequential Pipelining)
+# 5) The Bridge Export (CSV -> Excel)
 # -------------------------------------------------------------------------
 try {
-    Write-Host "[*] Saving Final Report..." -ForegroundColor Cyan
+    Write-Host "[*] Saving final report..." -ForegroundColor Cyan
     
-    # Write Sheet 1: Inventory
-    $Inventory | Sort-Object Grade -Descending | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow
+    # Write to CSV first (Atomic and safe)
+    $Inventory | Export-Csv -Path $TempCsv -NoTypeInformation
     
-    # Write Sheet 2: Dashboard (Adding to existing file)
-    $DashboardData | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -Title "POSTURE SUMMARY" -TitleBold -TitleSize 16 -AutoSize
+    # Import CSV and save as Excel (Starts a fresh Excel handle)
+    $FinalInventory = Import-Csv $TempCsv
+    $FinalInventory | Sort-Object Grade -Descending | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow
     
-    # Write Table 3: Domain Analysis (Adding to Dashboard sheet)
-    $DomainSummary | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -StartRow 7 -TableName "DomainUsage" -AutoSize
-
-    # Apply formatting separately to ensure the worksheets are "found"
+    # Add Dashboard
+    $Dash | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -Title "POSTURE SUMMARY" -AutoSize
+    
+    # Only format if data actually exists in the columns
     $Pkg = Open-ExcelPackage -Path $ExcelPath
     $Pkg.Workbook.Worksheets.MoveToStart("Dashboard")
-    $invSheet = $Pkg.Workbook.Worksheets["Inventory"]
+    $ws = $Pkg.Workbook.Worksheets["Inventory"]
     
-    Add-ConditionalFormatting -Worksheet $invSheet -Address "H:H" -RuleType Equal -ConditionValue "A" -ForegroundColor White -BackgroundColor Green
-    Add-ConditionalFormatting -Worksheet $invSheet -Address "H:H" -RuleType Equal -ConditionValue "C" -ForegroundColor Black -BackgroundColor Orange
-    Add-ConditionalFormatting -Worksheet $invSheet -Address "H:H" -RuleType Equal -ConditionValue "F" -ForegroundColor White -BackgroundColor Red
+    # Grade is in Column G for this reduced property list
+    if ($ws.Dimension.Rows -gt 1) {
+        Add-ConditionalFormatting -Worksheet $ws -Address "G2:G$($ws.Dimension.Rows)" -RuleType Equal -ConditionValue "A" -ForegroundColor White -BackgroundColor Green
+        Add-ConditionalFormatting -Worksheet $ws -Address "G2:G$($ws.Dimension.Rows)" -RuleType Equal -ConditionValue "C" -ForegroundColor Black -BackgroundColor Orange
+        Add-ConditionalFormatting -Worksheet $ws -Address "G2:G$($ws.Dimension.Rows)" -RuleType Equal -ConditionValue "F" -ForegroundColor White -BackgroundColor Red
+    }
     
     Close-ExcelPackage -ExcelPackage $Pkg
+    if (Test-Path $TempCsv) { Remove-Item $TempCsv }
     
     Write-Host "[+] Success! Report saved: $ExcelPath" -ForegroundColor Green
 } catch {
