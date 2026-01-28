@@ -1,8 +1,8 @@
 <#
 .SYNOPSIS
-    IISentinel Pro v4.2 - "The Consultant Build"
-    LOCKED CORE: v4.1 remains unchanged.
-    ADDED: Connectivity tracking and "Unreachable" reporting tab.
+    IISentinel Pro v4.3 - The Solution Provider
+    LOCKED CORE: v4.1 audit engine is unchanged.
+    ADDED: Remediation tab with copy-paste PowerShell fixes.
 #>
 
 [CmdletBinding()]
@@ -13,7 +13,7 @@ param(
     [pscredential]$Credential,
     [string]$OutputPath = "C:\IISentinel",
     [int]$WarningDays = 60,
-    [string]$ClientName = "Internal Audit" # New Branding Parameter
+    [string]$ClientName = "Internal Audit"
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,7 +24,7 @@ $RunDate = Get-Date
 $TimeStamp = $RunDate.ToString("yyyyMMdd-HHmm")
 $ExcelPath = Join-Path $OutputPath "IISentinel_Audit_$TimeStamp.xlsx"
 
-# 2) Discovery & Connection Tracking
+# 2) Discovery & Connection Tracking (Locked Logic)
 Write-Host "[*] Discovering targets..." -ForegroundColor Cyan
 $Targets = [System.Collections.Generic.List[string]]::new()
 if ($ServerNames) { $Targets.AddRange($ServerNames) }
@@ -36,19 +36,12 @@ if ($OU) {
 }
 $UniqueTargets = $Targets | Sort-Object -Unique
 
-# TRACKING: Capture failures here without touching the core scan
 Write-Host "[*] Verifying connectivity for $($UniqueTargets.Count) servers..." -ForegroundColor Cyan
-$OnlineServers = @()
-$OfflineServers = @()
-
+$OnlineServers = @(); $OfflineServers = @()
 foreach ($Server in $UniqueTargets) {
-    if (Test-Connection -ComputerName $Server -Count 1 -Quiet) {
-        $OnlineServers += $Server
-    } else {
-        $OfflineServers += [pscustomobject]@{ ServerName = $Server; Status = "Offline/Ping Failed"; Latency = "N/A" }
-    }
+    if (Test-Connection -ComputerName $Server -Count 1 -Quiet) { $OnlineServers += $Server } 
+    else { $OfflineServers += [pscustomobject]@{ ServerName = $Server; Status = "Offline"; Latency = "N/A" } }
 }
-
 if (-not $OnlineServers) { Write-Error "No servers responded to ping."; return }
 
 # 3) Remote Audit Logic (LOCKED v4.1 - DO NOT CHANGE)
@@ -100,59 +93,70 @@ $Inventory = Invoke-Command -ComputerName $OnlineServers -Credential $Credential
              Where-Object { $_.ServerName } | 
              Select-Object ServerName, SiteName, Protocol, Port, CertSubject, SAN, DaysLeft, Grade, Risk
 
-# TRACKING: Capture WinRM failures (Servers that pinged but returned no data)
-$AuditedServers = $Inventory.ServerName | Sort-Object -Unique
-$WinRMFailures = $OnlineServers | Where-Object { $_ -notin $AuditedServers } | ForEach-Object {
-    [pscustomobject]@{ ServerName = $_; Status = "WinRM Denied/No IIS Found"; Latency = "Online" }
+# 4) Remediation Logic (NEW - Local Processing Only)
+$RemediationList = @()
+foreach ($issue in ($Inventory | Where-Object { $_.Grade -ne "A" })) {
+    $fix = ""
+    if ($issue.Risk -match "MissingRedirect") {
+        $fix = "Set-WebConfigurationProperty -pspath 'IIS:\Sites\$($issue.SiteName)' -filter 'system.webServer/httpRedirect' -name 'enabled' -value 'True'"
+    }
+    elseif ($issue.Risk -match "WeakTLS") {
+        $fix = "New-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0\Server' -Name 'Enabled' -Value 0 -PropertyType DWord -Force"
+    }
+    elseif ($issue.Grade -eq "F" -and $issue.CertSubject -eq "N/A") {
+        $fix = "Check HTTPS Binding on Port $($issue.Port) - No Certificate is currently associated."
+    }
+
+    if ($fix) {
+        $RemediationList += [pscustomobject]@{
+            Server = $issue.ServerName
+            Site   = $issue.SiteName
+            Issue  = $issue.Risk
+            PowerShell_Remediation = $fix
+        }
+    }
 }
-$FullFailureLog = $OfflineServers + $WinRMFailures
 
-# 4) Analytics
-$HealthScore = "{0:P0}" -f (($Inventory | Where-Object { $_.Grade -match "A|B" }).Count / $Inventory.Count)
-$DashData = @(
-    [pscustomobject]@{ Client = $ClientName; Date = $RunDate.ToShortDateString() }
-    [pscustomobject]@{ Metric = "Fleet Health Score"; Value = $HealthScore }
-    [pscustomobject]@{ Metric = "Total Bindings Audited"; Value = $Inventory.Count }
-    [pscustomobject]@{ Metric = "Unreachable Assets"; Value = $FullFailureLog.Count }
-)
-
-# 5) The "Zero-Break" Export
+# 5) Export & Styling
 try {
     Write-Host "[*] Saving Branded Security Audit Report..." -ForegroundColor Cyan
     
-    # Export Data Sheets
+    # Standard Sheets
     $Inventory | Sort-Object Grade -Descending | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow
+    
+    # Dash Metrics
+    $DashData = @(
+        [pscustomobject]@{ Client = $ClientName; Date = $RunDate.ToShortDateString() }
+        [pscustomobject]@{ Metric = "Fleet Health Score"; Value = ("{0:P0}" -f (($Inventory | Where-Object {$_.Grade -match "A|B"}).Count / $Inventory.Count)) }
+        [pscustomobject]@{ Metric = "Issues Requiring Fix"; Value = $RemediationList.Count }
+    )
     $DashData | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -Title "$ClientName Security Summary" -AutoSize
     
-    # NEW SHEET: Connectivity Report
-    if ($FullFailureLog) {
-        $FullFailureLog | Export-Excel -Path $ExcelPath -WorksheetName "Connectivity_Issues" -TableStyle Medium1 -AutoSize
+    # Remediation Sheet
+    if ($RemediationList) {
+        $RemediationList | Export-Excel -Path $ExcelPath -WorksheetName "Remediation_Plan" -TableStyle Medium9 -AutoSize
     }
 
-    # Style via the LOCKED EPPlus Loop
+    # Connectivity Sheet (From v4.2)
+    $AuditedServers = $Inventory.ServerName | Sort-Object -Unique
+    $FullFailLog = $OfflineServers + ($OnlineServers | Where-Object { $_ -notin $AuditedServers } | ForEach-Object { [pscustomobject]@{ ServerName=$_; Status="WinRM Denied"; Latency="Online" } })
+    $FullFailLog | Export-Excel -Path $ExcelPath -WorksheetName "Connectivity_Issues" -AutoSize
+
+    # Style Locked Loop
     $Pkg = Open-ExcelPackage -Path $ExcelPath
     $Pkg.Workbook.Worksheets.MoveToStart("Dashboard")
     $ws = $Pkg.Workbook.Worksheets["Inventory"]
-    
     if ($ws.Dimension) {
         for ($i = 2; $i -le $ws.Dimension.Rows; $i++) {
             $cell = $ws.Cells[$i, 8]
-            $val = $cell.Value
             $cell.Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
-            if ($val -eq "A") { 
-                $cell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::Green)
-                $cell.Style.Font.Color.SetColor([System.Drawing.Color]::White)
-            }
-            elseif ($val -eq "C") { $cell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::Orange) }
-            elseif ($val -eq "F") { 
-                $cell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::Red)
-                $cell.Style.Font.Color.SetColor([System.Drawing.Color]::White)
-            }
+            if ($cell.Value -eq "A") { $cell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::Green); $cell.Style.Font.Color.SetColor([System.Drawing.Color]::White) }
+            elseif ($cell.Value -eq "C") { $cell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::Orange) }
+            elseif ($cell.Value -eq "F") { $cell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::Red); $cell.Style.Font.Color.SetColor([System.Drawing.Color]::White) }
         }
     }
-
     Close-ExcelPackage -ExcelPackage $Pkg
-    Write-Host "[+] Success! Freelance Audit Report saved: $ExcelPath" -ForegroundColor Green
+    Write-Host "[+] Success! Report saved: $ExcelPath" -ForegroundColor Green
 } catch {
     Write-Error "Export failed: $($_.Exception.Message)"
 }
