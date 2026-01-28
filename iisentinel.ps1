@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-    IISentinel Pro v3.3 - Atomic Export Edition
-    Fix: Uses a single ExcelPackage session to prevent "Worksheet Not Found" errors.
+    IISentinel Pro v3.4 - Streamlined Export
+    Fix: Uses the most basic pipeline-to-file method to avoid Worksheet conflicts.
 #>
 
 [CmdletBinding()]
@@ -22,7 +22,7 @@ $RunDate = Get-Date
 $TimeStamp = $RunDate.ToString("yyyyMMdd-HHmm")
 $ExcelPath = Join-Path $OutputPath "IISentinel_Security_Audit_$TimeStamp.xlsx"
 
-# 2) Discovery
+# 2) Discovery (Proven Solid)
 Write-Host "[*] Discovering targets..." -ForegroundColor Cyan
 $Targets = [System.Collections.Generic.List[string]]::new()
 if ($ServerNames) { $Targets.AddRange($ServerNames) }
@@ -37,7 +37,7 @@ $OnlineServers = $UniqueTargets | Where-Object { Test-Connection -ComputerName $
 
 if (-not $OnlineServers) { Write-Error "No servers responded to ping."; return }
 
-# 3) Remote Audit Logic
+# 3) Remote Audit Logic (Proven Resilient)
 $RemoteScript = {
     param($WarningDays)
     $results = @()
@@ -109,45 +109,42 @@ if ($TotalSites -eq 0) { Write-Error "No IIS data returned."; return }
 
 $HealthScore = "{0:P0}" -f (($Inventory | Where-Object { $_.Grade -match "A|B" }).Count / $TotalSites)
 $DomainSummary = $Inventory | Where-Object { $_.CertSubject -ne "N/A" } | Group-Object CertSubject | 
-                 Select-Object @{N="Certificate Domain";E={$_.Name}}, @{N="UsageCount";E={$_.Count}} | 
-                 Sort-Object UsageCount -Descending | Select-Object -First 10
+                 Select-Object @{N="Cert Domain";E={$_.Name}}, @{N="Usage";E={$_.Count}} | 
+                 Sort-Object Usage -Descending | Select-Object -First 10
 
 $DashboardData = @(
-    [pscustomobject]@{ "Metric" = "Fleet Health Score"; "Value" = $HealthScore }
-    [pscustomobject]@{ "Metric" = "Total Bindings Audited"; "Value" = $TotalSites }
-    [pscustomobject]@{ "Metric" = "Security Issues (C/F)"; "Value" = ($Inventory | Where-Object {$_.Grade -match "C|F"}).Count }
+    [pscustomobject]@{ Metric = "Fleet Health Score"; Value = $HealthScore }
+    [pscustomobject]@{ Metric = "Total Bindings Audited"; Value = $TotalSites }
+    [pscustomobject]@{ Metric = "Security Issues (C/F)"; Value = ($Inventory | Where-Object {$_.Grade -match "C|F"}).Count }
 )
 
 # -------------------------------------------------------------------------
-# 5) Atomic Export (The "One-Save" Method)
+# 5) The "No-Frills" Export (Sequential Pipelining)
 # -------------------------------------------------------------------------
 try {
-    Write-Host "[*] Generating Report in memory..." -ForegroundColor Cyan
+    Write-Host "[*] Saving Final Report..." -ForegroundColor Cyan
     
-    # 1. Create a blank Excel Package object first
-    $Pkg = New-Object OfficeOpenXml.ExcelPackage
-
-    # 2. Add Dashboard Sheet and Data
-    $DashSheet = $Pkg.Workbook.Worksheets.Add("Dashboard")
-    $DashboardData | Export-Excel -ExcelPackage $Pkg -WorksheetName "Dashboard" -Title "POSTURE SUMMARY" -TitleBold -TitleSize 16 -AutoSize
-    $DomainSummary | Export-Excel -ExcelPackage $Pkg -WorksheetName "Dashboard" -StartRow 7 -TableName "DomainUsage" -AutoSize
-
-    # 3. Add Inventory Sheet and Data
-    $InvSheet = $Pkg.Workbook.Worksheets.Add("Inventory")
-    $Inventory | Sort-Object Grade -Descending | Export-Excel -ExcelPackage $Pkg -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow
-
-    # 4. Apply Formatting while the package is still in memory
-    # Note: Using Column H for Grade
-    Add-ConditionalFormatting -Worksheet $InvSheet -Address "H:H" -RuleType Equal -ConditionValue "A" -ForegroundColor White -BackgroundColor Green
-    Add-ConditionalFormatting -Worksheet $InvSheet -Address "H:H" -RuleType Equal -ConditionValue "C" -ForegroundColor Black -BackgroundColor Orange
-    Add-ConditionalFormatting -Worksheet $InvSheet -Address "H:H" -RuleType Equal -ConditionValue "F" -ForegroundColor White -BackgroundColor Red
-
-    # 5. Save the file ONCE
-    Write-Host "[*] Committing to disk: $ExcelPath" -ForegroundColor Cyan
-    $Pkg.SaveAs($ExcelPath)
-    $Pkg.Dispose()
+    # Write Sheet 1: Inventory
+    $Inventory | Sort-Object Grade -Descending | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow
     
-    Write-Host "[+] Success! Report saved." -ForegroundColor Green
+    # Write Sheet 2: Dashboard (Adding to existing file)
+    $DashboardData | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -Title "POSTURE SUMMARY" -TitleBold -TitleSize 16 -AutoSize
+    
+    # Write Table 3: Domain Analysis (Adding to Dashboard sheet)
+    $DomainSummary | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -StartRow 7 -TableName "DomainUsage" -AutoSize
+
+    # Apply formatting separately to ensure the worksheets are "found"
+    $Pkg = Open-ExcelPackage -Path $ExcelPath
+    $Pkg.Workbook.Worksheets.MoveToStart("Dashboard")
+    $invSheet = $Pkg.Workbook.Worksheets["Inventory"]
+    
+    Add-ConditionalFormatting -Worksheet $invSheet -Address "H:H" -RuleType Equal -ConditionValue "A" -ForegroundColor White -BackgroundColor Green
+    Add-ConditionalFormatting -Worksheet $invSheet -Address "H:H" -RuleType Equal -ConditionValue "C" -ForegroundColor Black -BackgroundColor Orange
+    Add-ConditionalFormatting -Worksheet $invSheet -Address "H:H" -RuleType Equal -ConditionValue "F" -ForegroundColor White -BackgroundColor Red
+    
+    Close-ExcelPackage -ExcelPackage $Pkg
+    
+    Write-Host "[+] Success! Report saved: $ExcelPath" -ForegroundColor Green
 } catch {
     Write-Error "Export failed: $($_.Exception.Message)"
 }
