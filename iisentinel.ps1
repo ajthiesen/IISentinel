@@ -1,3 +1,10 @@
+<#
+.SYNOPSIS
+    IISentinel Pro v4.2 - "The Consultant Build"
+    LOCKED CORE: v4.1 remains unchanged.
+    ADDED: Connectivity tracking and "Unreachable" reporting tab.
+#>
+
 [CmdletBinding()]
 param(
     [Parameter(ValueFromPipeline = $true)]
@@ -5,7 +12,8 @@ param(
     [string]$OU,
     [pscredential]$Credential,
     [string]$OutputPath = "C:\IISentinel",
-    [int]$WarningDays = 60
+    [int]$WarningDays = 60,
+    [string]$ClientName = "Internal Audit" # New Branding Parameter
 )
 
 $ErrorActionPreference = "Stop"
@@ -16,7 +24,7 @@ $RunDate = Get-Date
 $TimeStamp = $RunDate.ToString("yyyyMMdd-HHmm")
 $ExcelPath = Join-Path $OutputPath "IISentinel_Audit_$TimeStamp.xlsx"
 
-# 2) Discovery
+# 2) Discovery & Connection Tracking
 Write-Host "[*] Discovering targets..." -ForegroundColor Cyan
 $Targets = [System.Collections.Generic.List[string]]::new()
 if ($ServerNames) { $Targets.AddRange($ServerNames) }
@@ -27,11 +35,23 @@ if ($OU) {
     } catch { Write-Error "AD Search failed."; return }
 }
 $UniqueTargets = $Targets | Sort-Object -Unique
-$OnlineServers = $UniqueTargets | Where-Object { Test-Connection -ComputerName $_ -Count 1 -Quiet }
+
+# TRACKING: Capture failures here without touching the core scan
+Write-Host "[*] Verifying connectivity for $($UniqueTargets.Count) servers..." -ForegroundColor Cyan
+$OnlineServers = @()
+$OfflineServers = @()
+
+foreach ($Server in $UniqueTargets) {
+    if (Test-Connection -ComputerName $Server -Count 1 -Quiet) {
+        $OnlineServers += $Server
+    } else {
+        $OfflineServers += [pscustomobject]@{ ServerName = $Server; Status = "Offline/Ping Failed"; Latency = "N/A" }
+    }
+}
 
 if (-not $OnlineServers) { Write-Error "No servers responded to ping."; return }
 
-# 3) Remote Audit Logic
+# 3) Remote Audit Logic (LOCKED v4.1 - DO NOT CHANGE)
 $RemoteScript = {
     param($WarningDays)
     if (-not (Get-Module -Name WebAdministration)) { Import-Module WebAdministration -ErrorAction SilentlyContinue }
@@ -40,7 +60,6 @@ $RemoteScript = {
     $tls10 = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0\Server" -Name Enabled -ErrorAction SilentlyContinue
     $tls11 = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1\Server" -Name Enabled -ErrorAction SilentlyContinue
     $weakTLS = ($tls10.Enabled -eq 1 -or $tls11.Enabled -eq 1)
-
     $certMap = @{}
     Get-ChildItem Cert:\LocalMachine -Recurse | Where-Object {$_.Thumbprint} | ForEach-Object { if(!$certMap.ContainsKey($_.Thumbprint)){$certMap[$_.Thumbprint]=$_} }
     
@@ -48,11 +67,9 @@ $RemoteScript = {
     foreach ($site in (Get-ChildItem IIS:\Sites)) {
         $hasHttps = $false; $hasHttp = $false
         $redirect = (Get-WebConfigurationProperty -pspath "IIS:\Sites\$($site.Name)" -filter "system.webServer/httpRedirect" -name "enabled").Value
-
         foreach ($bind in $site.Bindings.Collection) {
             $port = ($bind.bindingInformation -split ":")[1]
             $grade = "A"; $risk = @(); $certData = $null
-            
             if ($bind.protocol -eq "https") {
                 $hasHttps = $true
                 if ($port -ne "443") { $grade = "B"; $risk += "NonStandardPort" }
@@ -65,7 +82,6 @@ $RemoteScript = {
                     $certData = [pscustomobject]@{ Sub=$c.Subject; SAN=$sanList; Days=$days }
                 } else { $grade = "F" }
             } elseif ($bind.protocol -eq "http") { $hasHttp = $true }
-
             $results += [pscustomobject]@{ 
                 ServerName=$env:COMPUTERNAME; SiteName=$site.Name; Protocol=$bind.protocol; Port=$port;
                 CertSubject=if($certData){$certData.Sub}else{"N/A"}; SAN=if($certData){$certData.SAN}else{"N/A"};
@@ -84,28 +100,40 @@ $Inventory = Invoke-Command -ComputerName $OnlineServers -Credential $Credential
              Where-Object { $_.ServerName } | 
              Select-Object ServerName, SiteName, Protocol, Port, CertSubject, SAN, DaysLeft, Grade, Risk
 
+# TRACKING: Capture WinRM failures (Servers that pinged but returned no data)
+$AuditedServers = $Inventory.ServerName | Sort-Object -Unique
+$WinRMFailures = $OnlineServers | Where-Object { $_ -notin $AuditedServers } | ForEach-Object {
+    [pscustomobject]@{ ServerName = $_; Status = "WinRM Denied/No IIS Found"; Latency = "Online" }
+}
+$FullFailureLog = $OfflineServers + $WinRMFailures
+
 # 4) Analytics
 $HealthScore = "{0:P0}" -f (($Inventory | Where-Object { $_.Grade -match "A|B" }).Count / $Inventory.Count)
 $DashData = @(
+    [pscustomobject]@{ Client = $ClientName; Date = $RunDate.ToShortDateString() }
     [pscustomobject]@{ Metric = "Fleet Health Score"; Value = $HealthScore }
     [pscustomobject]@{ Metric = "Total Bindings Audited"; Value = $Inventory.Count }
+    [pscustomobject]@{ Metric = "Unreachable Assets"; Value = $FullFailureLog.Count }
 )
 
-# 5) The "No-Frills" Export
+# 5) The "Zero-Break" Export
 try {
-    Write-Host "[*] Saving Security Audit Report..." -ForegroundColor Cyan
+    Write-Host "[*] Saving Branded Security Audit Report..." -ForegroundColor Cyan
     
-    # Write raw data first (This will work even if formatting fails)
+    # Export Data Sheets
     $Inventory | Sort-Object Grade -Descending | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow
-    $DashData | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -Title "POSTURE SUMMARY" -AutoSize
+    $DashData | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -Title "$ClientName Security Summary" -AutoSize
+    
+    # NEW SHEET: Connectivity Report
+    if ($FullFailureLog) {
+        $FullFailureLog | Export-Excel -Path $ExcelPath -WorksheetName "Connectivity_Issues" -TableStyle Medium1 -AutoSize
+    }
 
-    # Open the file for manual styling
+    # Style via the LOCKED EPPlus Loop
     $Pkg = Open-ExcelPackage -Path $ExcelPath
     $Pkg.Workbook.Worksheets.MoveToStart("Dashboard")
     $ws = $Pkg.Workbook.Worksheets["Inventory"]
     
-    # Manual loop: Column 8 is 'Grade'
-    # This uses direct object manipulation to avoid cmdlet parameter errors
     if ($ws.Dimension) {
         for ($i = 2; $i -le $ws.Dimension.Rows; $i++) {
             $cell = $ws.Cells[$i, 8]
@@ -115,9 +143,7 @@ try {
                 $cell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::Green)
                 $cell.Style.Font.Color.SetColor([System.Drawing.Color]::White)
             }
-            elseif ($val -eq "C") { 
-                $cell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::Orange) 
-            }
+            elseif ($val -eq "C") { $cell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::Orange) }
             elseif ($val -eq "F") { 
                 $cell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::Red)
                 $cell.Style.Font.Color.SetColor([System.Drawing.Color]::White)
@@ -126,7 +152,7 @@ try {
     }
 
     Close-ExcelPackage -ExcelPackage $Pkg
-    Write-Host "[+] Success! Report saved: $ExcelPath" -ForegroundColor Green
+    Write-Host "[+] Success! Freelance Audit Report saved: $ExcelPath" -ForegroundColor Green
 } catch {
     Write-Error "Export failed: $($_.Exception.Message)"
 }
