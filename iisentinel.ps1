@@ -1,8 +1,8 @@
 <#
 .SYNOPSIS
-    IISentinel Pro v4.7 - The Fallback Edition
-    LOCKED CORE: v4.1 Remote Audit Engine + v4.5.5 Reporting Structure.
-    FIX: Added Fuzzy Fallback and CCS Detection to resolve "N/A" data.
+    IISentinel Pro v4.8 - The Universal Hash Fix
+    LOCKED CORE: v4.1 Remote Audit Engine + v4.5.5 Reporting.
+    FIX: Universal Hash Cleaner handles both String and Byte[] hash types.
 #>
 
 [CmdletBinding()]
@@ -46,7 +46,7 @@ foreach ($Server in $UniqueTargets) {
     }
 }
 
-# 3) Remote Audit Logic (ENHANCED WITH FUZZY FALLBACK)
+# 3) Remote Audit Logic (UNIVERSAL HASH CLEANER)
 $RemoteScript = {
     param($WarningDays)
     if (-not (Get-Module -Name WebAdministration)) { Import-Module WebAdministration -ErrorAction SilentlyContinue }
@@ -56,7 +56,7 @@ $RemoteScript = {
     $tls11 = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1\Server" -Name Enabled -ErrorAction SilentlyContinue
     $weakTLS = ($tls10.Enabled -eq 1 -or $tls11.Enabled -eq 1)
     
-    # Load ALL stores to be safe
+    # Load ALL certificate stores
     $allCerts = Get-ChildItem Cert:\LocalMachine\My, Cert:\LocalMachine\WebHosting -ErrorAction SilentlyContinue
     
     $results = @()
@@ -74,17 +74,28 @@ $RemoteScript = {
                 if ($port -ne "443") { $grade = "B"; $risk += "NonStandardPort" }
                 if ($weakTLS) { $grade = "C"; $risk += "WeakTLS" }
                 
-                # Method 1: Try Hash (Safe Accessor)
-                $rawHash = $bind.GetAttributeValue("certificateHash")
-                $flags   = $bind.GetAttributeValue("sslFlags") # Check for CCS
-                $foundCert = $null
-
+                # --- UNIVERSAL HASH CLEANER ---
+                $rawHash = $bind.certificateHash
+                $cleanHash = ""
+                
                 if ($rawHash) {
-                    $lookupHash = [System.BitConverter]::ToString($rawHash).Replace("-","")
-                    $foundCert = $allCerts | Where-Object { $_.Thumbprint -eq $lookupHash } | Select-Object -First 1
+                    if ($rawHash -is [byte[]]) {
+                        # Convert Byte Array to Hex String
+                        $cleanHash = [System.BitConverter]::ToString($rawHash).Replace("-","")
+                    } elseif ($rawHash -is [string]) {
+                        # Already a string, just clean it
+                        $cleanHash = $rawHash.Replace(" ","").Replace(":","").ToUpper()
+                    }
+                }
+                # ------------------------------
+
+                $foundCert = $null
+                # Method 1: Exact Hash Match
+                if ($cleanHash) {
+                    $foundCert = $allCerts | Where-Object { $_.Thumbprint -eq $cleanHash } | Select-Object -First 1
                 }
                 
-                # Method 2: Fuzzy Fallback (Match by Hostname)
+                # Method 2: Fuzzy Fallback (Hostname)
                 if (-not $foundCert -and $hostName) {
                     $foundCert = $allCerts | Where-Object { $_.Subject -match $hostName -or $_.DnsNameList -contains $hostName } | Select-Object -First 1
                     if ($foundCert) { $risk += "FuzzyMatchUsed" }
@@ -92,19 +103,18 @@ $RemoteScript = {
 
                 if ($foundCert) {
                     $diff = [math]::Round(($foundCert.NotAfter-(Get-Date)).TotalDays)
-                    $daysStr = [string]$diff # Forced String
+                    $daysStr = [string]$diff
                     $sub = $foundCert.Subject
                     $tp = $foundCert.Thumbprint
                     $san = ($foundCert.Extensions | Where-Object { $_.Oid.FriendlyName -match "Subject Alternative Name" }).Format($false)
                     if ($diff -lt 0) { $grade = "F" } elseif ($diff -lt 30) { $grade = "B" }
-                } elseif ($flags -eq 2 -or $flags -eq 3) {
-                     # Centralized Certificate Store detected
-                     $grade = "A" # Assume managed if CCS, or set to Check
-                     $risk += "CCS:Managed"
-                     $daysStr = "CCS"
-                     $sub = "Centralized Store"
-                } else { 
-                    $grade = "F"; $risk += "CertNotFound" 
+                } else {
+                    $flags = $bind.GetAttributeValue("sslFlags")
+                    if ($flags -eq 2 -or $flags -eq 3) {
+                         $grade = "A"; $risk += "CCS:Managed"; $daysStr = "CCS"; $sub = "Centralized Store"
+                    } else {
+                         $grade = "F"; $risk += "CertNotFound"
+                    }
                 }
 
             } elseif ($bind.protocol -eq "http") { $hasHttp = $true }
@@ -124,7 +134,7 @@ $RemoteScript = {
 Write-Host "[*] Auditing $($OnlineServers.Count) servers via WinRM..." -ForegroundColor Cyan
 $InventoryRaw = Invoke-Command -ComputerName $OnlineServers -Credential $Credential -ScriptBlock $RemoteScript -ArgumentList $WarningDays -ThrottleLimit 20 -ErrorAction SilentlyContinue 
 
-# 4) Post-Processing (Restored v4.5.5 Logic)
+# 4) Post-Processing (Standard v4.5.5 Logic)
 $Inventory = $InventoryRaw | Where-Object { $_.ServerName } | Select-Object ServerName, SiteName, Protocol, Port, CertSubject, Thumbprint, SAN, DaysLeft, Grade, Risk
 $GradeCounts = $Inventory | Group-Object Grade | Select-Object @{N="Grade";E={$_.Name}}, Count | Sort-Object Grade
 
@@ -137,7 +147,7 @@ foreach ($issue in ($Inventory | Where-Object { $_.Grade -ne "A" })) {
     $fix = switch -regex ($issue.Risk) {
         "MissingRedirect" { "Set-WebConfigurationProperty -pspath 'IIS:\Sites\$($issue.SiteName)' -filter 'system.webServer/httpRedirect' -name 'enabled' -value 'True'" }
         "WeakTLS" { "New-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0\Server' -Name 'Enabled' -Value 0 -PropertyType DWord -Force" }
-        "CertNotFound" { "Certificate missing from Local Store. Re-import certificate or check CCS path." }
+        "CertNotFound" { "Cert missing from Local/WebHosting Store. Re-import." }
         default { if($issue.Grade -eq "F") { "Bind valid SSL certificate to port $($issue.Port)" } }
     }
     if ($fix) { $RemediationList += [pscustomobject]@{ Server=$issue.ServerName; Site=$issue.SiteName; Issue=$issue.Risk; PowerShell_Fix=$fix } }
@@ -145,7 +155,7 @@ foreach ($issue in ($Inventory | Where-Object { $_.Grade -ne "A" })) {
 
 # 5) Stable Export (Locked v4.5.5 Logic)
 try {
-    Write-Host "[*] Saving Fallback Audit Report..." -ForegroundColor Cyan
+    Write-Host "[*] Saving Universal Hash Audit..." -ForegroundColor Cyan
     $Inventory | Sort-Object Grade -Descending | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow
     
     $DashData = @(
@@ -183,7 +193,7 @@ try {
     }
     $dashSheet.View.ShowGridLines = $false; $Pkg.Workbook.Worksheets.MoveToStart("Dashboard")
     Close-ExcelPackage -ExcelPackage $Pkg
-    Write-Host "[+] Success! 'N/A' should now be populated or marked CCS." -ForegroundColor Green
+    Write-Host "[+] Success! 'Universal Hash' logic applied." -ForegroundColor Green
     explorer.exe /select,$ExcelPath
 } catch {
     Write-Error "Export failed: $($_.Exception.Message)"
