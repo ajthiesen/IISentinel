@@ -1,8 +1,8 @@
 <#
 .SYNOPSIS
-    IISentinel Pro v4.4 - The Executive Dashboard
-    LOCKED CORE: v4.1 audit engine is unchanged.
-    ADDED: Dashboard Pie Chart showing A vs C vs F distribution.
+    IISentinel Pro v4.5 - The Master Consultant Build
+    LOCKED CORE: v4.1 remains the engine.
+    INCLUDES: Dashboard Chart, Remediation Plan, Connectivity Log.
 #>
 
 [CmdletBinding()]
@@ -24,7 +24,7 @@ $RunDate = Get-Date
 $TimeStamp = $RunDate.ToString("yyyyMMdd-HHmm")
 $ExcelPath = Join-Path $OutputPath "IISentinel_Audit_$TimeStamp.xlsx"
 
-# 2) Discovery & Connection Tracking (Locked Logic)
+# 2) Discovery & Connection Tracking
 Write-Host "[*] Discovering targets..." -ForegroundColor Cyan
 $Targets = [System.Collections.Generic.List[string]]::new()
 if ($ServerNames) { $Targets.AddRange($ServerNames) }
@@ -40,7 +40,7 @@ Write-Host "[*] Verifying connectivity for $($UniqueTargets.Count) servers..." -
 $OnlineServers = @(); $OfflineServers = @()
 foreach ($Server in $UniqueTargets) {
     if (Test-Connection -ComputerName $Server -Count 1 -Quiet) { $OnlineServers += $Server } 
-    else { $OfflineServers += [pscustomobject]@{ ServerName = $Server; Status = "Offline"; Latency = "N/A" } }
+    else { $OfflineServers += [pscustomobject]@{ ServerName = $Server; Status = "Offline/Ping Failed"; Latency = "N/A" } }
 }
 if (-not $OnlineServers) { Write-Error "No servers responded to ping."; return }
 
@@ -93,12 +93,26 @@ $Inventory = Invoke-Command -ComputerName $OnlineServers -Credential $Credential
              Where-Object { $_.ServerName } | 
              Select-Object ServerName, SiteName, Protocol, Port, CertSubject, SAN, DaysLeft, Grade, Risk
 
-# 4) Data Aggregation for Charting
+# 4) Post-Processing (Remediation & Connectivity)
+$AuditedServers = $Inventory.ServerName | Sort-Object -Unique
+$WinRMFailures = $OnlineServers | Where-Object { $_ -notin $AuditedServers } | ForEach-Object { [pscustomobject]@{ ServerName=$_; Status="WinRM Denied/No IIS"; Latency="Online" } }
+$FullFailLog = $OfflineServers + $WinRMFailures
+
+$RemediationList = @()
+foreach ($issue in ($Inventory | Where-Object { $_.Grade -ne "A" })) {
+    $fix = switch -regex ($issue.Risk) {
+        "MissingRedirect" { "Set-WebConfigurationProperty -pspath 'IIS:\Sites\$($issue.SiteName)' -filter 'system.webServer/httpRedirect' -name 'enabled' -value 'True'" }
+        "WeakTLS" { "New-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0\Server' -Name 'Enabled' -Value 0 -PropertyType DWord -Force" }
+        default { if($issue.Grade -eq "F" -and $issue.CertSubject -eq "N/A") { "Bind valid SSL certificate to port $($issue.Port)" } }
+    }
+    if ($fix) { $RemediationList += [pscustomobject]@{ Server=$issue.ServerName; Site=$issue.SiteName; Issue=$issue.Risk; PowerShell_Fix=$fix } }
+}
+
 $GradeCounts = $Inventory | Group-Object Grade | Select-Object @{N="Grade";E={$_.Name}}, Count
 
-# 5) Export & Styling
+# 5) Stable Export & Visualization
 try {
-    Write-Host "[*] Saving Branded Security Audit Report..." -ForegroundColor Cyan
+    Write-Host "[*] Saving All-In-One Audit Report..." -ForegroundColor Cyan
     
     # Export Data Sheets
     $Inventory | Sort-Object Grade -Descending | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow
@@ -107,35 +121,28 @@ try {
     $DashData = @(
         [pscustomobject]@{ Client = $ClientName; Date = $RunDate.ToShortDateString() }
         [pscustomobject]@{ Metric = "Fleet Health Score"; Value = ("{0:P0}" -f (($Inventory | Where-Object {$_.Grade -match "A|B"}).Count / $Inventory.Count)) }
-        [pscustomobject]@{ Metric = "Total Bindings"; Value = $Inventory.Count }
+        [pscustomobject]@{ Metric = "Total Bindings Audited"; Value = $Inventory.Count }
+        [pscustomobject]@{ Metric = "Security Fixes Identified"; Value = $RemediationList.Count }
     )
     $DashData | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -Title "$ClientName Security Summary" -AutoSize
     
-    # Export Grade Data for Chart (Hidden in Dashboard area)
+    # Supporting Tabs
     $GradeCounts | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -StartRow 10 -TableName "ChartData"
+    if ($RemediationList) { $RemediationList | Export-Excel -Path $ExcelPath -WorksheetName "Remediation_Plan" -TableStyle Medium9 -AutoSize }
+    if ($FullFailLog) { $FullFailLog | Export-Excel -Path $ExcelPath -WorksheetName "Connectivity_Issues" -TableStyle Medium1 -AutoSize }
 
-    # Remediation & Connectivity (From v4.3)
-    # ... (Skipped for brevity in display, but included in logic)
-
-    # Styling and Charting via EPPlus
+    # Styling & Charting (EPPlus)
     $Pkg = Open-ExcelPackage -Path $ExcelPath
     $dashSheet = $Pkg.Workbook.Worksheets["Dashboard"]
     $invSheet = $Pkg.Workbook.Worksheets["Inventory"]
 
-    # --- ADD PIE CHART ---
+    # Chart Generation
     $chart = $dashSheet.Drawings.AddChart("HealthChart", [OfficeOpenXml.Drawing.Chart.eChartType]::Pie)
-    $chart.SetPosition(2, 0, 5, 0) # Position: Row 2, Col 5
-    $chart.SetSize(400, 300)
-    $chart.Title.Text = "Security Grade Distribution"
-    
-    # Link data from the ChartData table we just exported
-    # Rows 11 to 11 + count (Grades), Columns 1 (Names) and 2 (Counts)
-    $rangeLabel = "A11:A$(10 + $GradeCounts.Count)"
-    $rangeValue = "B11:B$(10 + $GradeCounts.Count)"
-    $series = $chart.Series.Add($dashSheet.Cells[$rangeValue], $dashSheet.Cells[$rangeLabel])
+    $chart.SetPosition(2, 0, 5, 0); $chart.SetSize(400, 300); $chart.Title.Text = "Security Grade Distribution"
+    $series = $chart.Series.Add($dashSheet.Cells["B11:B$(10 + $GradeCounts.Count)"], $dashSheet.Cells["A11:A$(10 + $GradeCounts.Count)"])
     $chart.DataLabel.ShowPercent = $true
 
-    # Standard Styling Loop (LOCKED)
+    # Inventory Coloring (LOCKED Loop)
     if ($invSheet.Dimension) {
         for ($i = 2; $i -le $invSheet.Dimension.Rows; $i++) {
             $cell = $invSheet.Cells[$i, 8]
@@ -150,7 +157,8 @@ try {
     $Pkg.Workbook.Worksheets.MoveToStart("Dashboard")
     Close-ExcelPackage -ExcelPackage $Pkg
     
-    Write-Host "[+] Success! Professional Report saved: $ExcelPath" -ForegroundColor Green
+    Write-Host "[+] Success! Master Report saved: $ExcelPath" -ForegroundColor Green
+    explorer.exe /select,$ExcelPath
 } catch {
     Write-Error "Export failed: $($_.Exception.Message)"
 }
