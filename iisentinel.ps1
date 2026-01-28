@@ -1,8 +1,8 @@
 <#
 .SYNOPSIS
-    IISentinel Pro v4.8 - The Universal Hash Fix
-    LOCKED CORE: v4.1 Remote Audit Engine + v4.5.5 Reporting.
-    FIX: Universal Hash Cleaner handles both String and Byte[] hash types.
+    IISentinel Pro v4.9 - Clean Inventory Edition
+    LOCKED CORE: v4.1 Remote Audit + v4.8 Hash Logic.
+    CHANGE: Removed redundant 'Protocol' column for cleaner reporting.
 #>
 
 [CmdletBinding()]
@@ -46,7 +46,7 @@ foreach ($Server in $UniqueTargets) {
     }
 }
 
-# 3) Remote Audit Logic (UNIVERSAL HASH CLEANER)
+# 3) Remote Audit Logic (LOCKED v4.8 UNIVERSAL HASH)
 $RemoteScript = {
     param($WarningDays)
     if (-not (Get-Module -Name WebAdministration)) { Import-Module WebAdministration -ErrorAction SilentlyContinue }
@@ -56,7 +56,6 @@ $RemoteScript = {
     $tls11 = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1\Server" -Name Enabled -ErrorAction SilentlyContinue
     $weakTLS = ($tls10.Enabled -eq 1 -or $tls11.Enabled -eq 1)
     
-    # Load ALL certificate stores
     $allCerts = Get-ChildItem Cert:\LocalMachine\My, Cert:\LocalMachine\WebHosting -ErrorAction SilentlyContinue
     
     $results = @()
@@ -74,28 +73,18 @@ $RemoteScript = {
                 if ($port -ne "443") { $grade = "B"; $risk += "NonStandardPort" }
                 if ($weakTLS) { $grade = "C"; $risk += "WeakTLS" }
                 
-                # --- UNIVERSAL HASH CLEANER ---
+                # Universal Hash Cleaner
                 $rawHash = $bind.certificateHash
                 $cleanHash = ""
-                
                 if ($rawHash) {
-                    if ($rawHash -is [byte[]]) {
-                        # Convert Byte Array to Hex String
-                        $cleanHash = [System.BitConverter]::ToString($rawHash).Replace("-","")
-                    } elseif ($rawHash -is [string]) {
-                        # Already a string, just clean it
-                        $cleanHash = $rawHash.Replace(" ","").Replace(":","").ToUpper()
-                    }
+                    if ($rawHash -is [byte[]]) { $cleanHash = [System.BitConverter]::ToString($rawHash).Replace("-","") } 
+                    elseif ($rawHash -is [string]) { $cleanHash = $rawHash.Replace(" ","").Replace(":","").ToUpper() }
                 }
-                # ------------------------------
 
                 $foundCert = $null
-                # Method 1: Exact Hash Match
-                if ($cleanHash) {
-                    $foundCert = $allCerts | Where-Object { $_.Thumbprint -eq $cleanHash } | Select-Object -First 1
-                }
+                if ($cleanHash) { $foundCert = $allCerts | Where-Object { $_.Thumbprint -eq $cleanHash } | Select-Object -First 1 }
                 
-                # Method 2: Fuzzy Fallback (Hostname)
+                # Fuzzy Fallback
                 if (-not $foundCert -and $hostName) {
                     $foundCert = $allCerts | Where-Object { $_.Subject -match $hostName -or $_.DnsNameList -contains $hostName } | Select-Object -First 1
                     if ($foundCert) { $risk += "FuzzyMatchUsed" }
@@ -134,8 +123,9 @@ $RemoteScript = {
 Write-Host "[*] Auditing $($OnlineServers.Count) servers via WinRM..." -ForegroundColor Cyan
 $InventoryRaw = Invoke-Command -ComputerName $OnlineServers -Credential $Credential -ScriptBlock $RemoteScript -ArgumentList $WarningDays -ThrottleLimit 20 -ErrorAction SilentlyContinue 
 
-# 4) Post-Processing (Standard v4.5.5 Logic)
-$Inventory = $InventoryRaw | Where-Object { $_.ServerName } | Select-Object ServerName, SiteName, Protocol, Port, CertSubject, Thumbprint, SAN, DaysLeft, Grade, Risk
+# 4) Post-Processing (REMOVED PROTOCOL COLUMN)
+# New Column Order: ServerName(1), SiteName(2), Port(3), CertSubject(4), Thumbprint(5), SAN(6), DaysLeft(7), Grade(8), Risk(9)
+$Inventory = $InventoryRaw | Where-Object { $_.ServerName } | Select-Object ServerName, SiteName, Port, CertSubject, Thumbprint, SAN, DaysLeft, Grade, Risk
 $GradeCounts = $Inventory | Group-Object Grade | Select-Object @{N="Grade";E={$_.Name}}, Count | Sort-Object Grade
 
 $AuditedServers = $Inventory.ServerName | Sort-Object -Unique
@@ -153,9 +143,9 @@ foreach ($issue in ($Inventory | Where-Object { $_.Grade -ne "A" })) {
     if ($fix) { $RemediationList += [pscustomobject]@{ Server=$issue.ServerName; Site=$issue.SiteName; Issue=$issue.Risk; PowerShell_Fix=$fix } }
 }
 
-# 5) Stable Export (Locked v4.5.5 Logic)
+# 5) Stable Export
 try {
-    Write-Host "[*] Saving Universal Hash Audit..." -ForegroundColor Cyan
+    Write-Host "[*] Saving Clean Report..." -ForegroundColor Cyan
     $Inventory | Sort-Object Grade -Descending | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow
     
     $DashData = @(
@@ -177,9 +167,12 @@ try {
     $series = $chart.Series.Add($dashSheet.Cells["B11:B$(10 + $GradeCounts.Count)"], $dashSheet.Cells["A11:A$(10 + $GradeCounts.Count)"])
     $chart.DataLabel.ShowPercent = $true
 
+    # ADJUSTED STYLING LOOP (Shifted left by 1)
     if ($invSheet.Dimension) {
         for ($i = 2; $i -le $invSheet.Dimension.Rows; $i++) {
-            $dayCell = $invSheet.Cells[$i, 8]; $gradeCell = $invSheet.Cells[$i, 9]
+            $dayCell = $invSheet.Cells[$i, 7]   # Was 8
+            $gradeCell = $invSheet.Cells[$i, 8] # Was 9
+            
             $gradeCell.Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
             if ($gradeCell.Value -eq "A") { $gradeCell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::Green); $gradeCell.Style.Font.Color.SetColor([System.Drawing.Color]::White) }
             elseif ($gradeCell.Value -eq "C") { $gradeCell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::Orange) }
@@ -193,7 +186,7 @@ try {
     }
     $dashSheet.View.ShowGridLines = $false; $Pkg.Workbook.Worksheets.MoveToStart("Dashboard")
     Close-ExcelPackage -ExcelPackage $Pkg
-    Write-Host "[+] Success! 'Universal Hash' logic applied." -ForegroundColor Green
+    Write-Host "[+] Success! Protocol column removed." -ForegroundColor Green
     explorer.exe /select,$ExcelPath
 } catch {
     Write-Error "Export failed: $($_.Exception.Message)"
