@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-    IISentinel Pro v3.9 - Final Range Fix
-    Fix: Explicitly bound ConditionalText to the 'Grade' column header.
+    IISentinel Pro v3.9.1 - Final Formatting Address Fix
+    Fix: Uses Column H address for Grade formatting to satisfy EPPlus requirements.
 #>
 
 [CmdletBinding()]
@@ -108,14 +108,14 @@ $DashboardData = @(
     [pscustomobject]@{ Metric = "Security Issues (C/F)"; Value = ($Inventory | Where-Object {$_.Grade -match "C|F"}).Count }
 )
 
-# 5) The "No-Fail" Export
+# 5) The Stable Export
 try {
     Write-Host "[*] Saving Security Audit Report..." -ForegroundColor Cyan
     
-    # FIX: Explicitly specify the 'Range' (Column Name) for the formatting rules
-    $RuleA = New-ConditionalText -Range "Grade" -Text "A" -BackgroundColor Green -ForegroundColor White
-    $RuleC = New-ConditionalText -Range "Grade" -Text "C" -BackgroundColor Orange -ForegroundColor Black
-    $RuleF = New-ConditionalText -Range "Grade" -Text "F" -BackgroundColor Red -ForegroundColor White
+    # Address H:H is the "Grade" column (8th property in our Select-Object above)
+    $RuleA = New-ConditionalText -Address "H:H" -Text "A" -BackgroundColor Green -ForegroundColor White
+    $RuleC = New-ConditionalText -Address "H:H" -Text "C" -BackgroundColor Orange -ForegroundColor Black
+    $RuleF = New-ConditionalText -Address "H:H" -Text "F" -BackgroundColor Red -ForegroundColor White
 
     # 1. Export Inventory
     $Inventory | Sort-Object Grade -Descending | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" `
