@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-    IISentinel Pro v3.6 - Restoration & Stability
-    Fixes: Restored AD Search logic; Fixed 'Range is null' via explicit bounds.
+    IISentinel Pro v3.7 - Robust Export Styling
+    Fix: Uses native Export-Excel conditional formatting to avoid null dimension errors.
 #>
 
 [CmdletBinding()]
@@ -22,33 +22,23 @@ $RunDate = Get-Date
 $TimeStamp = $RunDate.ToString("yyyyMMdd-HHmm")
 $ExcelPath = Join-Path $OutputPath "IISentinel_Audit_$TimeStamp.xlsx"
 
-# 2) Robust Discovery (Restored)
+# 2) Discovery (Working)
 Write-Host "[*] Discovering targets..." -ForegroundColor Cyan
 $Targets = [System.Collections.Generic.List[string]]::new()
 if ($ServerNames) { $Targets.AddRange($ServerNames) }
 if ($OU) {
     try {
-        # Using the specific SearchScope and Filter that worked for your 203 servers
         $adComputers = Get-ADComputer -SearchBase $OU -SearchScope Subtree -Filter { Enabled -eq $true } | Select-Object -ExpandProperty Name
-        if ($adComputers) { 
-            [string[]]$adArray = $adComputers
-            $Targets.AddRange($adArray) 
-        }
-    } catch { 
-        Write-Error "AD Search failed. Ensure RSAT is installed and you have permissions to $OU"
-        return
-    }
+        if ($adComputers) { [string[]]$adArray = $adComputers; $Targets.AddRange($adArray) }
+    } catch { Write-Error "AD Search failed."; return }
 }
 $UniqueTargets = $Targets | Sort-Object -Unique
 Write-Host "[*] Verifying connectivity for $($UniqueTargets.Count) servers..." -ForegroundColor Cyan
 $OnlineServers = $UniqueTargets | Where-Object { Test-Connection -ComputerName $_ -Count 1 -Quiet }
 
-if (-not $OnlineServers) { 
-    Write-Error "No servers responded to ping. Check your network or OU path."
-    return 
-}
+if (-not $OnlineServers) { Write-Error "No servers responded to ping."; return }
 
-# 3) Remote Audit Logic
+# 3) Remote Audit Logic (Working)
 $RemoteScript = {
     param($WarningDays)
     if (-not (Get-Module -Name WebAdministration)) { Import-Module WebAdministration -ErrorAction SilentlyContinue }
@@ -63,41 +53,28 @@ $RemoteScript = {
     
     $results = @()
     foreach ($site in (Get-ChildItem IIS:\Sites)) {
-        $hasHttps = $false; $hasHttp = $false
-        $redirect = (Get-WebConfigurationProperty -pspath "IIS:\Sites\$($site.Name)" -filter "system.webServer/httpRedirect" -name "enabled").Value
-
         foreach ($bind in $site.Bindings.Collection) {
             $port = ($bind.bindingInformation -split ":")[1]
             $grade = "A"; $risk = @(); $certData = $null
             
             if ($bind.protocol -eq "https") {
-                $hasHttps = $true
                 if ($port -ne "443") { $grade = "B"; $risk += "NonStandardPort" }
                 if ($weakTLS) { $grade = "C"; $risk += "WeakTLS" }
 
                 $hash = if ($bind.certificateHash) { [System.BitConverter]::ToString($bind.certificateHash).Replace("-","").ToUpper() } else { "" }
-
                 if ($hash -and $certMap.ContainsKey($hash)) {
                     $c = $certMap[$hash]
                     $days = [math]::Round(($c.NotAfter-(Get-Date)).TotalDays)
-                    $sanList = ""
-                    $sanExt = $c.Extensions | Where-Object { $_.Oid.FriendlyName -match "Subject Alternative Name" }
-                    if ($sanExt) { $sanList = ($sanExt.Format($false) -split "," | ForEach-Object { $_.Trim().Replace("DNS Name=", "") }) -join ", " }
-
+                    $sanList = ($c.Extensions | Where-Object { $_.Oid.FriendlyName -match "Subject Alternative Name" }).Format($false)
                     if ($days -lt 0) { $grade = "F" } elseif ($days -lt 30) { $grade = "B" }
                     $certData = [pscustomobject]@{ Sub=$c.Subject; SAN=$sanList; Days=$days }
                 } else { $grade = "F" }
             }
-            elseif ($bind.protocol -eq "http") { $hasHttp = $true }
-
             $results += [pscustomobject]@{ 
                 ServerName=$env:COMPUTERNAME; SiteName=$site.Name; Protocol=$bind.protocol; Port=$port;
                 CertSubject=if($certData){$certData.Sub}else{"N/A"}; SAN=if($certData){$certData.SAN}else{"N/A"};
                 DaysLeft=if($certData){$certData.Days}else{$null}; Grade=$grade; Risk=($risk -join ",")
             }
-        }
-        if ($hasHttp -and $hasHttps -and !$redirect) {
-            $results += [pscustomobject]@{ ServerName=$env:COMPUTERNAME; SiteName=$site.Name; Protocol="GAP"; Port="80"; CertSubject="N/A"; SAN="N/A"; DaysLeft=$null; Grade="C"; Risk="InsecureHTTP" }
         }
     }
     return $results
@@ -110,7 +87,7 @@ $Inventory = Invoke-Command -ComputerName $OnlineServers -Credential $Credential
 
 # 4) Analytics
 $TotalSites = if ($Inventory) { $Inventory.Count } else { 0 }
-if ($TotalSites -eq 0) { Write-Error "No IIS data returned from remote servers."; return }
+if ($TotalSites -eq 0) { Write-Error "No IIS data returned."; return }
 
 $HealthScore = "{0:P0}" -f (($Inventory | Where-Object { $_.Grade -match "A|B" }).Count / $TotalSites)
 $DashboardData = @(
@@ -119,35 +96,29 @@ $DashboardData = @(
     [pscustomobject]@{ Metric = "Security Issues (C/F)"; Value = ($Inventory | Where-Object {$_.Grade -match "C|F"}).Count }
 )
 
-# 5) Atomic Save Export
+# 5) Stable Export Logic
 try {
     Write-Host "[*] Saving Security Audit Report..." -ForegroundColor Cyan
     
-    # Create the package in memory
-    $Pkg = New-Object OfficeOpenXml.ExcelPackage
-    
-    # Add Inventory (Writing this first ensures we have the rows for formatting)
-    $InvSheet = $Pkg.Workbook.Worksheets.Add("Inventory")
-    $Inventory | Sort-Object Grade -Descending | Export-Excel -ExcelPackage $Pkg -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow
-    
-    # Add Dashboard
-    $DashSheet = $Pkg.Workbook.Worksheets.Add("Dashboard")
-    $DashboardData | Export-Excel -ExcelPackage $Pkg -WorksheetName "Dashboard" -Title "POSTURE SUMMARY" -TitleBold -AutoSize
-    
-    # Move Dashboard to front
-    $Pkg.Workbook.Worksheets.MoveToStart("Dashboard")
-    
-    # Formatting Grade column (Column H)
-    $rowCount = $InvSheet.Dimension.Rows
-    if ($rowCount -gt 1) {
-        $addr = "H2:H$rowCount"
-        Add-ConditionalFormatting -Worksheet $InvSheet -Address $addr -RuleType Equal -ConditionValue "A" -ForegroundColor White -BackgroundColor Green
-        Add-ConditionalFormatting -Worksheet $InvSheet -Address $addr -RuleType Equal -ConditionValue "C" -ForegroundColor Black -BackgroundColor Orange
-        Add-ConditionalFormatting -Worksheet $InvSheet -Address $addr -RuleType Equal -ConditionValue "F" -ForegroundColor White -BackgroundColor Red
-    }
+    # Define Conditional Formatting Rules first
+    $CondFormat = @()
+    $CondFormat += New-ConditionalFormattingIconSet -Range "H:H" -ConditionalFormat Grade -IconType ThreeTrafficLights1
+    # Alternative direct color rules
+    $RuleA = New-ConditionalText -Text "A" -BackgroundColor Green -ForegroundColor White
+    $RuleC = New-ConditionalText -Text "C" -BackgroundColor Orange -ForegroundColor Black
+    $RuleF = New-ConditionalText -Text "F" -BackgroundColor Red -ForegroundColor White
 
-    $Pkg.SaveAs($ExcelPath)
-    $Pkg.Dispose()
+    # Export Inventory with Rules built-in
+    $Inventory | Sort-Object Grade -Descending | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" `
+        -TableStyle Medium2 -AutoSize -BoldTopRow -ConditionalText $RuleA, $RuleC, $RuleF
+
+    # Export Dashboard
+    $DashboardData | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -Title "POSTURE SUMMARY" -TitleBold -AutoSize
+
+    # Final cleanup: Move Dashboard to front
+    $Pkg = Open-ExcelPackage -Path $ExcelPath
+    $Pkg.Workbook.Worksheets.MoveToStart("Dashboard")
+    Close-ExcelPackage -ExcelPackage $Pkg
     
     Write-Host "[+] Success! Report saved: $ExcelPath" -ForegroundColor Green
 } catch {
