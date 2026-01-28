@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-    IISentinel Pro v3.2.1 - Stability Build
-    Fix: Replaced -Data parameter with pipeline input for older ImportExcel versions.
+    IISentinel Pro v3.3 - Atomic Export Edition
+    Fix: Uses a single ExcelPackage session to prevent "Worksheet Not Found" errors.
 #>
 
 [CmdletBinding()]
@@ -118,32 +118,36 @@ $DashboardData = @(
     [pscustomobject]@{ "Metric" = "Security Issues (C/F)"; "Value" = ($Inventory | Where-Object {$_.Grade -match "C|F"}).Count }
 )
 
-# 5) Sequential Export (Pipeline-First Method)
+# -------------------------------------------------------------------------
+# 5) Atomic Export (The "One-Save" Method)
+# -------------------------------------------------------------------------
 try {
-    Write-Host "[*] Saving Security Audit Report..." -ForegroundColor Cyan
+    Write-Host "[*] Generating Report in memory..." -ForegroundColor Cyan
     
-    # 1. Export Inventory (Initializes file)
-    $Inventory | Sort-Object Grade -Descending | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow
-    
-    # 2. Re-open Package to add Dashboard
-    $Pkg = Open-ExcelPackage -Path $ExcelPath
-    
-    # 3. Pipeline data into Dashboard
+    # 1. Create a blank Excel Package object first
+    $Pkg = New-Object OfficeOpenXml.ExcelPackage
+
+    # 2. Add Dashboard Sheet and Data
+    $DashSheet = $Pkg.Workbook.Worksheets.Add("Dashboard")
     $DashboardData | Export-Excel -ExcelPackage $Pkg -WorksheetName "Dashboard" -Title "POSTURE SUMMARY" -TitleBold -TitleSize 16 -AutoSize
     $DomainSummary | Export-Excel -ExcelPackage $Pkg -WorksheetName "Dashboard" -StartRow 7 -TableName "DomainUsage" -AutoSize
 
-    # 4. Final Formatting
-    $Pkg.Workbook.Worksheets.MoveToStart("Dashboard")
-    $invSheet = $Pkg.Workbook.Worksheets["Inventory"]
+    # 3. Add Inventory Sheet and Data
+    $InvSheet = $Pkg.Workbook.Worksheets.Add("Inventory")
+    $Inventory | Sort-Object Grade -Descending | Export-Excel -ExcelPackage $Pkg -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow
+
+    # 4. Apply Formatting while the package is still in memory
+    # Note: Using Column H for Grade
+    Add-ConditionalFormatting -Worksheet $InvSheet -Address "H:H" -RuleType Equal -ConditionValue "A" -ForegroundColor White -BackgroundColor Green
+    Add-ConditionalFormatting -Worksheet $InvSheet -Address "H:H" -RuleType Equal -ConditionValue "C" -ForegroundColor Black -BackgroundColor Orange
+    Add-ConditionalFormatting -Worksheet $InvSheet -Address "H:H" -RuleType Equal -ConditionValue "F" -ForegroundColor White -BackgroundColor Red
+
+    # 5. Save the file ONCE
+    Write-Host "[*] Committing to disk: $ExcelPath" -ForegroundColor Cyan
+    $Pkg.SaveAs($ExcelPath)
+    $Pkg.Dispose()
     
-    # Column H is Grade
-    Add-ConditionalFormatting -Worksheet $invSheet -Address "H:H" -RuleType Equal -ConditionValue "A" -ForegroundColor White -BackgroundColor Green
-    Add-ConditionalFormatting -Worksheet $invSheet -Address "H:H" -RuleType Equal -ConditionValue "C" -ForegroundColor Black -BackgroundColor Orange
-    Add-ConditionalFormatting -Worksheet $invSheet -Address "H:H" -RuleType Equal -ConditionValue "F" -ForegroundColor White -BackgroundColor Red
-    
-    Close-ExcelPackage -ExcelPackage $Pkg
-    
-    Write-Host "[+] Success! Report saved: $ExcelPath" -ForegroundColor Green
+    Write-Host "[+] Success! Report saved." -ForegroundColor Green
 } catch {
     Write-Error "Export failed: $($_.Exception.Message)"
 }
