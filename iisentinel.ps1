@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-    IISentinel Pro v3.7 - Robust Export Styling
-    Fix: Uses native Export-Excel conditional formatting to avoid null dimension errors.
+    IISentinel Pro v3.8 - Final Stability Build
+    Fix: Fixed ConditionalFormat ValidateSet error; restored full security metrics.
 #>
 
 [CmdletBinding()]
@@ -22,7 +22,7 @@ $RunDate = Get-Date
 $TimeStamp = $RunDate.ToString("yyyyMMdd-HHmm")
 $ExcelPath = Join-Path $OutputPath "IISentinel_Audit_$TimeStamp.xlsx"
 
-# 2) Discovery (Working)
+# 2) Discovery
 Write-Host "[*] Discovering targets..." -ForegroundColor Cyan
 $Targets = [System.Collections.Generic.List[string]]::new()
 if ($ServerNames) { $Targets.AddRange($ServerNames) }
@@ -38,12 +38,13 @@ $OnlineServers = $UniqueTargets | Where-Object { Test-Connection -ComputerName $
 
 if (-not $OnlineServers) { Write-Error "No servers responded to ping."; return }
 
-# 3) Remote Audit Logic (Working)
+# 3) Remote Audit Logic
 $RemoteScript = {
     param($WarningDays)
     if (-not (Get-Module -Name WebAdministration)) { Import-Module WebAdministration -ErrorAction SilentlyContinue }
     if (-not (Test-Path IIS:\Sites)) { return $null }
 
+    # TLS Check
     $tls10 = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0\Server" -Name Enabled -ErrorAction SilentlyContinue
     $tls11 = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1\Server" -Name Enabled -ErrorAction SilentlyContinue
     $weakTLS = ($tls10.Enabled -eq 1 -or $tls11.Enabled -eq 1)
@@ -53,11 +54,15 @@ $RemoteScript = {
     
     $results = @()
     foreach ($site in (Get-ChildItem IIS:\Sites)) {
+        $hasHttps = $false; $hasHttp = $false
+        $redirect = (Get-WebConfigurationProperty -pspath "IIS:\Sites\$($site.Name)" -filter "system.webServer/httpRedirect" -name "enabled").Value
+
         foreach ($bind in $site.Bindings.Collection) {
             $port = ($bind.bindingInformation -split ":")[1]
             $grade = "A"; $risk = @(); $certData = $null
             
             if ($bind.protocol -eq "https") {
+                $hasHttps = $true
                 if ($port -ne "443") { $grade = "B"; $risk += "NonStandardPort" }
                 if ($weakTLS) { $grade = "C"; $risk += "WeakTLS" }
 
@@ -69,12 +74,16 @@ $RemoteScript = {
                     if ($days -lt 0) { $grade = "F" } elseif ($days -lt 30) { $grade = "B" }
                     $certData = [pscustomobject]@{ Sub=$c.Subject; SAN=$sanList; Days=$days }
                 } else { $grade = "F" }
-            }
+            } elseif ($bind.protocol -eq "http") { $hasHttp = $true }
+
             $results += [pscustomobject]@{ 
                 ServerName=$env:COMPUTERNAME; SiteName=$site.Name; Protocol=$bind.protocol; Port=$port;
                 CertSubject=if($certData){$certData.Sub}else{"N/A"}; SAN=if($certData){$certData.SAN}else{"N/A"};
                 DaysLeft=if($certData){$certData.Days}else{$null}; Grade=$grade; Risk=($risk -join ",")
             }
+        }
+        if ($hasHttp -and $hasHttps -and -not $redirect) {
+            $results += [pscustomobject]@{ ServerName=$env:COMPUTERNAME; SiteName=$site.Name; Protocol="SECURITY_GAP"; Port="80"; CertSubject="N/A"; SAN="N/A"; DaysLeft=$null; Grade="C"; Risk="MissingRedirect" }
         }
     }
     return $results
@@ -90,32 +99,34 @@ $TotalSites = if ($Inventory) { $Inventory.Count } else { 0 }
 if ($TotalSites -eq 0) { Write-Error "No IIS data returned."; return }
 
 $HealthScore = "{0:P0}" -f (($Inventory | Where-Object { $_.Grade -match "A|B" }).Count / $TotalSites)
+$DomainSummary = $Inventory | Where-Object { $_.CertSubject -ne "N/A" } | Group-Object CertSubject | 
+                 Select-Object @{N="Cert Domain";E={$_.Name}}, @{N="Count";E={$_.Count}} | 
+                 Sort-Object Count -Descending | Select-Object -First 10
+
 $DashboardData = @(
     [pscustomobject]@{ Metric = "Fleet Health Score"; Value = $HealthScore }
     [pscustomobject]@{ Metric = "Total Bindings Audited"; Value = $TotalSites }
     [pscustomobject]@{ Metric = "Security Issues (C/F)"; Value = ($Inventory | Where-Object {$_.Grade -match "C|F"}).Count }
 )
 
-# 5) Stable Export Logic
+# 5) The "No-Fail" Export
 try {
     Write-Host "[*] Saving Security Audit Report..." -ForegroundColor Cyan
     
-    # Define Conditional Formatting Rules first
-    $CondFormat = @()
-    $CondFormat += New-ConditionalFormattingIconSet -Range "H:H" -ConditionalFormat Grade -IconType ThreeTrafficLights1
-    # Alternative direct color rules
+    # Define Rules (Cleaned of IconSet conflicts)
     $RuleA = New-ConditionalText -Text "A" -BackgroundColor Green -ForegroundColor White
     $RuleC = New-ConditionalText -Text "C" -BackgroundColor Orange -ForegroundColor Black
     $RuleF = New-ConditionalText -Text "F" -BackgroundColor Red -ForegroundColor White
 
-    # Export Inventory with Rules built-in
+    # 1. Export Inventory
     $Inventory | Sort-Object Grade -Descending | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" `
         -TableStyle Medium2 -AutoSize -BoldTopRow -ConditionalText $RuleA, $RuleC, $RuleF
 
-    # Export Dashboard
+    # 2. Export Dashboard & Domains
     $DashboardData | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -Title "POSTURE SUMMARY" -TitleBold -AutoSize
+    $DomainSummary | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -StartRow 7 -TableName "TopDomains" -AutoSize
 
-    # Final cleanup: Move Dashboard to front
+    # 3. Final Tab Move
     $Pkg = Open-ExcelPackage -Path $ExcelPath
     $Pkg.Workbook.Worksheets.MoveToStart("Dashboard")
     Close-ExcelPackage -ExcelPackage $Pkg
