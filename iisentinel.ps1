@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-    IISentinel Pro v3.2 - Final Stability Build
-    Fix: Sequential file writing to prevent "Worksheet Not Found" memory errors.
+    IISentinel Pro v3.2.1 - Stability Build
+    Fix: Replaced -Data parameter with pipeline input for older ImportExcel versions.
 #>
 
 [CmdletBinding()]
@@ -118,26 +118,21 @@ $DashboardData = @(
     [pscustomobject]@{ "Metric" = "Security Issues (C/F)"; "Value" = ($Inventory | Where-Object {$_.Grade -match "C|F"}).Count }
 )
 
-# -------------------------------------------------------------------------
-# 5) Sequential Export (The "No-Fail" Method)
-# -------------------------------------------------------------------------
+# 5) Sequential Export (Pipeline-First Method)
 try {
     Write-Host "[*] Saving Security Audit Report..." -ForegroundColor Cyan
     
-    # STEP 1: Create the file with the Inventory
+    # 1. Export Inventory (Initializes file)
     $Inventory | Sort-Object Grade -Descending | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow
     
-    # STEP 2: Re-open and add Dashboard (using -ExcelPackage to avoid worksheet-not-found issues)
+    # 2. Re-open Package to add Dashboard
     $Pkg = Open-ExcelPackage -Path $ExcelPath
     
-    # Create Dashboard sheet explicitly
-    $DashboardSheet = Add-Worksheet -ExcelPackage $Pkg -WorksheetName "Dashboard"
-    
-    # Add the data to the Dashboard sheet
-    Export-Excel -ExcelPackage $Pkg -WorksheetName "Dashboard" -Data $DashboardData -Title "POSTURE SUMMARY" -TitleBold -TitleSize 16 -AutoSize
-    Export-Excel -ExcelPackage $Pkg -WorksheetName "Dashboard" -Data $DomainSummary -StartRow 7 -TableName "DomainUsage" -AutoSize
+    # 3. Pipeline data into Dashboard
+    $DashboardData | Export-Excel -ExcelPackage $Pkg -WorksheetName "Dashboard" -Title "POSTURE SUMMARY" -TitleBold -TitleSize 16 -AutoSize
+    $DomainSummary | Export-Excel -ExcelPackage $Pkg -WorksheetName "Dashboard" -StartRow 7 -TableName "DomainUsage" -AutoSize
 
-    # STEP 3: Formatting
+    # 4. Final Formatting
     $Pkg.Workbook.Worksheets.MoveToStart("Dashboard")
     $invSheet = $Pkg.Workbook.Worksheets["Inventory"]
     
