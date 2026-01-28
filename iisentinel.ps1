@@ -1,8 +1,8 @@
 <#
 .SYNOPSIS
-    IISentinel Pro v4.5.2 - Fine-Grained Update
+    IISentinel Pro v4.5.3 - Full Integrity Build
     LOCKED CORE: v4.1 remains the engine.
-    FIX: Populated 'DaysLeft' column in the Inventory selection.
+    FIX: Fully restored styling loop and populated DaysLeft.
 #>
 
 [CmdletBinding()]
@@ -24,7 +24,7 @@ $RunDate = Get-Date
 $TimeStamp = $RunDate.ToString("yyyyMMdd-HHmm")
 $ExcelPath = Join-Path $OutputPath "IISentinel_Audit_$TimeStamp.xlsx"
 
-# 2) Discovery & Connection Tracking
+# 2) Discovery & Connection Tracking (Locked Logic)
 Write-Host "[*] Discovering targets..." -ForegroundColor Cyan
 $Targets = [System.Collections.Generic.List[string]]::new()
 if ($ServerNames) { $Targets.AddRange($ServerNames) }
@@ -44,7 +44,7 @@ foreach ($Server in $UniqueTargets) {
 }
 if (-not $OnlineServers) { Write-Error "No servers responded to ping."; return }
 
-# 3) Remote Audit Logic (LOCKED v4.1 - DO NOT CHANGE)
+# 3) Remote Audit Logic (LOCKED v4.1)
 $RemoteScript = {
     param($WarningDays)
     if (-not (Get-Module -Name WebAdministration)) { Import-Module WebAdministration -ErrorAction SilentlyContinue }
@@ -89,31 +89,35 @@ $RemoteScript = {
 }
 
 Write-Host "[*] Auditing $($OnlineServers.Count) servers via WinRM..." -ForegroundColor Cyan
-$Inventory = Invoke-Command -ComputerName $OnlineServers -Credential $Credential -ScriptBlock $RemoteScript -ArgumentList $WarningDays -ThrottleLimit 20 -ErrorAction SilentlyContinue | 
-             Where-Object { $_.ServerName } | 
-             Select-Object ServerName, SiteName, Protocol, Port, CertSubject, SAN, DaysLeft, Grade, Risk
-
-# 4) Post-Processing
-Write-Host "[*] Auditing $($OnlineServers.Count) servers via WinRM..." -ForegroundColor Cyan
-
-# UPDATED: Ensuring DaysLeft is explicitly mapped from the remote result
+# FIXED: DaysLeft Mapping
 $Inventory = Invoke-Command -ComputerName $OnlineServers -Credential $Credential -ScriptBlock $RemoteScript -ArgumentList $WarningDays -ThrottleLimit 20 -ErrorAction SilentlyContinue | 
              Where-Object { $_.ServerName } | 
              Select-Object ServerName, SiteName, Protocol, Port, CertSubject, SAN, 
                            @{N="DaysLeft"; E={if($_.DaysLeft -ne $null){$_.DaysLeft}else{"N/A"}}}, 
                            Grade, Risk
 
-# CHANGE: Force alphabetical sort on Grades for the Chart
+# 4) Post-Processing
+$AuditedServers = $Inventory.ServerName | Sort-Object -Unique
+$WinRMFailures = $OnlineServers | Where-Object { $_ -notin $AuditedServers } | ForEach-Object { [pscustomobject]@{ ServerName=$_; Status="WinRM Denied"; Latency="Online" } }
+$FullFailLog = $OfflineServers + $WinRMFailures
+
+$RemediationList = @()
+foreach ($issue in ($Inventory | Where-Object { $_.Grade -ne "A" })) {
+    $fix = switch -regex ($issue.Risk) {
+        "MissingRedirect" { "Set-WebConfigurationProperty -pspath 'IIS:\Sites\$($issue.SiteName)' -filter 'system.webServer/httpRedirect' -name 'enabled' -value 'True'" }
+        "WeakTLS" { "New-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0\Server' -Name 'Enabled' -Value 0 -PropertyType DWord -Force" }
+        default { if($issue.Grade -eq "F" -and $issue.CertSubject -eq "N/A") { "Bind valid SSL certificate to port $($issue.Port)" } }
+    }
+    if ($fix) { $RemediationList += [pscustomobject]@{ Server=$issue.ServerName; Site=$issue.SiteName; Issue=$issue.Risk; PowerShell_Fix=$fix } }
+}
 $GradeCounts = $Inventory | Group-Object Grade | Select-Object @{N="Grade";E={$_.Name}}, Count | Sort-Object Grade
 
-# 5) Stable Export (Locked Styling)
+# 5) Stable Export & Visualization
 try {
-    Write-Host "[*] Saving Report with Expiry Data..." -ForegroundColor Cyan
+    Write-Host "[*] Saving Master Report..." -ForegroundColor Cyan
     
-    # Export Data Sheets
     $Inventory | Sort-Object Grade -Descending | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow
     
-    # Dash Metrics
     $DashData = @(
         [pscustomobject]@{ Client = $ClientName; Date = $RunDate.ToShortDateString() }
         [pscustomobject]@{ Metric = "Fleet Health Score"; Value = ("{0:P0}" -f (($Inventory | Where-Object {$_.Grade -match "A|B"}).Count / $Inventory.Count)) }
@@ -122,27 +126,48 @@ try {
     )
     $DashData | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -Title "$ClientName Security Summary" -AutoSize
     
-    # Supporting Tabs (Ensuring Grade Table is sorted A-F)
     $GradeCounts | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -StartRow 10 -TableName "ChartData"
     if ($RemediationList) { $RemediationList | Export-Excel -Path $ExcelPath -WorksheetName "Remediation_Plan" -TableStyle Medium9 -AutoSize }
     if ($FullFailLog) { $FullFailLog | Export-Excel -Path $ExcelPath -WorksheetName "Connectivity_Issues" -TableStyle Medium1 -AutoSize }
 
-     Styling & Charting (EPPlus)
+    # --- FULL STYLING & CHARTING LOOP ---
     $Pkg = Open-ExcelPackage -Path $ExcelPath
     $dashSheet = $Pkg.Workbook.Worksheets["Dashboard"]
     $invSheet = $Pkg.Workbook.Worksheets["Inventory"]
 
-    # [Inventory Coloring Loop remains identical to v4.5]
-    # Note: Because we added the DaysLeft mapping, Column 8 is still Grade.
+    # Dashboard Chart
+    $chart = $dashSheet.Drawings.AddChart("HealthChart", [OfficeOpenXml.Drawing.Chart.eChartType]::Pie)
+    $chart.SetPosition(2, 0, 5, 0); $chart.SetSize(400, 300); $chart.Title.Text = "Security Grade Distribution"
+    $series = $chart.Series.Add($dashSheet.Cells["B11:B$(10 + $GradeCounts.Count)"], $dashSheet.Cells["A11:A$(10 + $GradeCounts.Count)"])
+    $chart.DataLabel.ShowPercent = $true
+
+    # Inventory Coloring (LOCKED)
     if ($invSheet.Dimension) {
         for ($i = 2; $i -le $invSheet.Dimension.Rows; $i++) {
-            $cell = $invSheet.Cells[$i, 8]
-            # ... [Color Logic for A, C, F] ...
+            # Column 7: DaysLeft | Column 8: Grade
+            $dayCell = $invSheet.Cells[$i, 7]
+            $gradeCell = $invSheet.Cells[$i, 8]
+            
+            # Grade Colors
+            $gradeCell.Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+            if ($gradeCell.Value -eq "A") { $gradeCell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::Green); $gradeCell.Style.Font.Color.SetColor([System.Drawing.Color]::White) }
+            elseif ($gradeCell.Value -eq "C") { $gradeCell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::Orange) }
+            elseif ($gradeCell.Value -eq "F") { $gradeCell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::Red); $gradeCell.Style.Font.Color.SetColor([System.Drawing.Color]::White) }
+            
+            # Expiry Warning (Yellow if < 30 days)
+            if ($dayCell.Value -ne "N/A" -and [int]$dayCell.Value -lt 30 -and [int]$dayCell.Value -ge 0) {
+                $dayCell.Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+                $dayCell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::Yellow)
+            }
         }
     }
 
+    $dashSheet.View.ShowGridLines = $false
+    $Pkg.Workbook.Worksheets.MoveToStart("Dashboard")
     Close-ExcelPackage -ExcelPackage $Pkg
-    Write-Host "[+] Success! Expiry data populated." -ForegroundColor Green
+    
+    Write-Host "[+] Success! Full Report saved: $ExcelPath" -ForegroundColor Green
+    explorer.exe /select,$ExcelPath
 } catch {
     Write-Error "Export failed: $($_.Exception.Message)"
 }
