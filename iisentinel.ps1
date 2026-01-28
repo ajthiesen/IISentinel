@@ -1,9 +1,3 @@
-<#
-.SYNOPSIS
-    IISentinel Pro v3.9.1 - Final Formatting Address Fix
-    Fix: Uses Column H address for Grade formatting to satisfy EPPlus requirements.
-#>
-
 [CmdletBinding()]
 param(
     [Parameter(ValueFromPipeline = $true)]
@@ -33,7 +27,6 @@ if ($OU) {
     } catch { Write-Error "AD Search failed."; return }
 }
 $UniqueTargets = $Targets | Sort-Object -Unique
-Write-Host "[*] Verifying connectivity for $($UniqueTargets.Count) servers..." -ForegroundColor Cyan
 $OnlineServers = $UniqueTargets | Where-Object { Test-Connection -ComputerName $_ -Count 1 -Quiet }
 
 if (-not $OnlineServers) { Write-Error "No servers responded to ping."; return }
@@ -64,11 +57,9 @@ $RemoteScript = {
                 $hasHttps = $true
                 if ($port -ne "443") { $grade = "B"; $risk += "NonStandardPort" }
                 if ($weakTLS) { $grade = "C"; $risk += "WeakTLS" }
-
                 $hash = if ($bind.certificateHash) { [System.BitConverter]::ToString($bind.certificateHash).Replace("-","").ToUpper() } else { "" }
                 if ($hash -and $certMap.ContainsKey($hash)) {
-                    $c = $certMap[$hash]
-                    $days = [math]::Round(($c.NotAfter-(Get-Date)).TotalDays)
+                    $c = $certMap[$hash]; $days = [math]::Round(($c.NotAfter-(Get-Date)).TotalDays)
                     $sanList = ($c.Extensions | Where-Object { $_.Oid.FriendlyName -match "Subject Alternative Name" }).Format($false)
                     if ($days -lt 0) { $grade = "F" } elseif ($days -lt 30) { $grade = "B" }
                     $certData = [pscustomobject]@{ Sub=$c.Subject; SAN=$sanList; Days=$days }
@@ -82,7 +73,7 @@ $RemoteScript = {
             }
         }
         if ($hasHttp -and $hasHttps -and -not $redirect) {
-            $results += [pscustomobject]@{ ServerName=$env:COMPUTERNAME; SiteName=$site.Name; Protocol="SECURITY_GAP"; Port="80"; CertSubject="N/A"; SAN="N/A"; DaysLeft=$null; Grade="C"; Risk="MissingRedirect" }
+            $results += [pscustomobject]@{ ServerName=$env:COMPUTERNAME; SiteName=$site.Name; Protocol="GAP"; Port="80"; CertSubject="N/A"; SAN="N/A"; DaysLeft=$null; Grade="C"; Risk="MissingRedirect" }
         }
     }
     return $results
@@ -94,42 +85,47 @@ $Inventory = Invoke-Command -ComputerName $OnlineServers -Credential $Credential
              Select-Object ServerName, SiteName, Protocol, Port, CertSubject, SAN, DaysLeft, Grade, Risk
 
 # 4) Analytics
-$TotalSites = if ($Inventory) { $Inventory.Count } else { 0 }
-if ($TotalSites -eq 0) { Write-Error "No IIS data returned."; return }
-
-$HealthScore = "{0:P0}" -f (($Inventory | Where-Object { $_.Grade -match "A|B" }).Count / $TotalSites)
-$DomainSummary = $Inventory | Where-Object { $_.CertSubject -ne "N/A" } | Group-Object CertSubject | 
-                 Select-Object @{N="Cert Domain";E={$_.Name}}, @{N="Count";E={$_.Count}} | 
-                 Sort-Object Count -Descending | Select-Object -First 10
-
-$DashboardData = @(
+$HealthScore = "{0:P0}" -f (($Inventory | Where-Object { $_.Grade -match "A|B" }).Count / $Inventory.Count)
+$DashData = @(
     [pscustomobject]@{ Metric = "Fleet Health Score"; Value = $HealthScore }
-    [pscustomobject]@{ Metric = "Total Bindings Audited"; Value = $TotalSites }
-    [pscustomobject]@{ Metric = "Security Issues (C/F)"; Value = ($Inventory | Where-Object {$_.Grade -match "C|F"}).Count }
+    [pscustomobject]@{ Metric = "Total Bindings Audited"; Value = $Inventory.Count }
 )
 
-# 5) The Stable Export
+# 5) The "No-Frills" Export
 try {
     Write-Host "[*] Saving Security Audit Report..." -ForegroundColor Cyan
     
-    # Address H:H is the "Grade" column (8th property in our Select-Object above)
-    $RuleA = New-ConditionalText -Address "H:H" -Text "A" -BackgroundColor Green -ForegroundColor White
-    $RuleC = New-ConditionalText -Address "H:H" -Text "C" -BackgroundColor Orange -ForegroundColor Black
-    $RuleF = New-ConditionalText -Address "H:H" -Text "F" -BackgroundColor Red -ForegroundColor White
+    # Write raw data first (This will work even if formatting fails)
+    $Inventory | Sort-Object Grade -Descending | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow
+    $DashData | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -Title "POSTURE SUMMARY" -AutoSize
 
-    # 1. Export Inventory
-    $Inventory | Sort-Object Grade -Descending | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" `
-        -TableStyle Medium2 -AutoSize -BoldTopRow -ConditionalText $RuleA, $RuleC, $RuleF
-
-    # 2. Export Dashboard & Domains
-    $DashboardData | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -Title "POSTURE SUMMARY" -TitleBold -AutoSize
-    $DomainSummary | Export-Excel -Path $ExcelPath -WorksheetName "Dashboard" -StartRow 7 -TableName "TopDomains" -AutoSize
-
-    # 3. Final Tab Move
+    # Open the file for manual styling
     $Pkg = Open-ExcelPackage -Path $ExcelPath
     $Pkg.Workbook.Worksheets.MoveToStart("Dashboard")
-    Close-ExcelPackage -ExcelPackage $Pkg
+    $ws = $Pkg.Workbook.Worksheets["Inventory"]
     
+    # Manual loop: Column 8 is 'Grade'
+    # This uses direct object manipulation to avoid cmdlet parameter errors
+    if ($ws.Dimension) {
+        for ($i = 2; $i -le $ws.Dimension.Rows; $i++) {
+            $cell = $ws.Cells[$i, 8]
+            $val = $cell.Value
+            $cell.Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+            if ($val -eq "A") { 
+                $cell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::Green)
+                $cell.Style.Font.Color.SetColor([System.Drawing.Color]::White)
+            }
+            elseif ($val -eq "C") { 
+                $cell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::Orange) 
+            }
+            elseif ($val -eq "F") { 
+                $cell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::Red)
+                $cell.Style.Font.Color.SetColor([System.Drawing.Color]::White)
+            }
+        }
+    }
+
+    Close-ExcelPackage -ExcelPackage $Pkg
     Write-Host "[+] Success! Report saved: $ExcelPath" -ForegroundColor Green
 } catch {
     Write-Error "Export failed: $($_.Exception.Message)"
