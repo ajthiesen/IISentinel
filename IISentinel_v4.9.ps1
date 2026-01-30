@@ -1,8 +1,8 @@
 <#
 .SYNOPSIS
-    IISentinel Pro v4.9 - Clean Inventory Edition
-    LOCKED CORE: v4.1 Remote Audit + v4.8 Hash Logic.
-    CHANGE: Removed redundant 'Protocol' column for cleaner reporting.
+    IISentinel Pro v5.0 - Live View Edition
+    - LOCKED CORE: v4.1 Audit Engine + v4.8 Universal Hash.
+    - NEW: Interactive GridView Popup for instant presentation.
 #>
 
 [CmdletBinding()]
@@ -123,8 +123,7 @@ $RemoteScript = {
 Write-Host "[*] Auditing $($OnlineServers.Count) servers via WinRM..." -ForegroundColor Cyan
 $InventoryRaw = Invoke-Command -ComputerName $OnlineServers -Credential $Credential -ScriptBlock $RemoteScript -ArgumentList $WarningDays -ThrottleLimit 20 -ErrorAction SilentlyContinue 
 
-# 4) Post-Processing (REMOVED PROTOCOL COLUMN)
-# New Column Order: ServerName(1), SiteName(2), Port(3), CertSubject(4), Thumbprint(5), SAN(6), DaysLeft(7), Grade(8), Risk(9)
+# 4) Post-Processing
 $Inventory = $InventoryRaw | Where-Object { $_.ServerName } | Select-Object ServerName, SiteName, Port, CertSubject, Thumbprint, SAN, DaysLeft, Grade, Risk
 $GradeCounts = $Inventory | Group-Object Grade | Select-Object @{N="Grade";E={$_.Name}}, Count | Sort-Object Grade
 
@@ -145,7 +144,7 @@ foreach ($issue in ($Inventory | Where-Object { $_.Grade -ne "A" })) {
 
 # 5) Stable Export
 try {
-    Write-Host "[*] Saving Clean Report..." -ForegroundColor Cyan
+    Write-Host "[*] Saving Excel Report..." -ForegroundColor Cyan
     $Inventory | Sort-Object Grade -Descending | Export-Excel -Path $ExcelPath -WorksheetName "Inventory" -TableStyle Medium2 -AutoSize -BoldTopRow
     
     $DashData = @(
@@ -167,11 +166,10 @@ try {
     $series = $chart.Series.Add($dashSheet.Cells["B11:B$(10 + $GradeCounts.Count)"], $dashSheet.Cells["A11:A$(10 + $GradeCounts.Count)"])
     $chart.DataLabel.ShowPercent = $true
 
-    # ADJUSTED STYLING LOOP (Shifted left by 1)
+    # Styling Loop
     if ($invSheet.Dimension) {
         for ($i = 2; $i -le $invSheet.Dimension.Rows; $i++) {
-            $dayCell = $invSheet.Cells[$i, 7]   # Was 8
-            $gradeCell = $invSheet.Cells[$i, 8] # Was 9
+            $dayCell = $invSheet.Cells[$i, 7]; $gradeCell = $invSheet.Cells[$i, 8]
             
             $gradeCell.Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
             if ($gradeCell.Value -eq "A") { $gradeCell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::Green); $gradeCell.Style.Font.Color.SetColor([System.Drawing.Color]::White) }
@@ -186,8 +184,14 @@ try {
     }
     $dashSheet.View.ShowGridLines = $false; $Pkg.Workbook.Worksheets.MoveToStart("Dashboard")
     Close-ExcelPackage -ExcelPackage $Pkg
-    Write-Host "[+] Success! Protocol column removed." -ForegroundColor Green
-    explorer.exe /select,$ExcelPath
+    
+    Write-Host "[+] Export Complete: $ExcelPath" -ForegroundColor Green
+
+    # --- NEW FEATURE: LIVE VIEW POPUP ---
+    Write-Host "[*] Launching Live View..." -ForegroundColor Cyan
+    $Inventory | Sort-Object Grade -Descending | Out-GridView -Title "Black Anchor Works | IISentinel Audit Results" -Wait
+    # ------------------------------------
+
 } catch {
     Write-Error "Export failed: $($_.Exception.Message)"
 }
